@@ -20,10 +20,9 @@ Shinken Sentinel 不以堆叠规则为目标，而是试图回答一个更基础
 
 ## 当前状态
 
-单一 KMDF 非 PnP 驱动 + 六层 WFP callout(ALE 裁决 + 流跟踪)+ 快照
-规则引擎 + 版本化 IOCTL 控制面 + 遥测事件队列，已实现并通过真实内核
-验证(见“验证边界”)。未实现: REDIRECT/INSPECT 动作与注入提交路径;
-ifIndex/SID 规则条件保留且不支持(验证直接拒绝, 详见 docs/RULE_ENGINE.md)。
+当前仓库提供内核框架源码与构建工程，围绕 WFP 网络分类、不可变规则快照、IOCTL 控制和事件记录展开研究，不是完整的终端安全产品。
+
+部分能力仍未接通：重定向、内容检查和数据包注入提交路径尚未实现；接口索引与用户 SID 条件仅保留协议标识，规则验证会拒绝使用这些条件。
 
 ## 模块
 
@@ -33,26 +32,23 @@ ifIndex/SID 规则条件保留且不支持(验证直接拒绝, 详见 docs/RULE_
 | `runtime/` | 生命周期终态机、rundown、注入门、阻断原因历史 |
 | `wfp/` | engine/provider/sublayer/callout/filter 安装与拆除状态机 |
 | `rules/` | 规则快照存储、评估、匹配、RATE_LIMIT 令牌桶 |
-| `packet/` | classify 热路径、注入、流上下文 |
+| `packet/` | classify 热路径、流上下文和注入资源生命周期 |
 | `control/` | IOCTL 协议与分发 |
 | `telemetry/` | 事件队列(生产者门 + 容量丢弃) |
 | `shim/` | 最小 WDK 垫片(仅 IR/宿主验证用) |
 
-详细设计: docs/ARCHITECTURE.md、docs/UNLOAD_SAFETY.md、
-docs/WFP_LIFETIME.md、docs/RULE_ENGINE.md、docs/THREAT_MODEL.md。
-
 ## 构建
-- 宿主验证(本仓库默认): `build.bat`(clang → LLVM IR)+
-  `tests\run_tests.bat`(宿主失败注入测试); 头文件走 `shim/`。
-- 真实 WDK 构建: `msbuild wdk\shinken_wfp.vcxproj /m /p:Configuration=Release /p:Platform=x64`
-  (前置、签名、安装门控见 wdk/README_WDK.md)。
+
+- LLVM 路径：[build.bat](build.bat) 使用 `shim/` 进行语法检查、IR 生成与 `opt -O2` 优化，不生成可加载驱动。通过 `LLVM_DIR` 指定包含 `bin/clang.exe`、`bin/llvm-link.exe` 和 `bin/opt.exe` 的安装目录。
+- WDK 路径：使用真实 WDK 头文件构建驱动，前置条件见 [WDK 构建说明](wdk/README_WDK.md)。在仓库根目录的 VS 开发者命令提示符中执行：
+
+```bat
+msbuild wdk\shinken_wfp.vcxproj /m /p:Configuration=Release /p:Platform=x64
+```
 
 ## 验证边界
 
-clang 语法检查(shim)+ LLVM IR + 宿主失败注入测试覆盖状态机/协议/
-并发交错/回滚/裁决语义; 真实 WDK 编译、真实内核加载、真实流量规则行为、
-IOCTL 走带与 Driver Verifier 的实测证据见
-docs/REAL_KERNEL_VALIDATION_20260913.md。SDV/HLK 未执行。
+本发布仓库不包含测试套件、部署包或环境验证报告。编译与 IR 优化只能检查对应构建路径，不能证明内核并发安全或网络策略一定生效。源码中的裁决结果也不等同于系统最终执行结果；这里不作“全部通过真实内核验证”的声明。
 
 ## 名称
 
