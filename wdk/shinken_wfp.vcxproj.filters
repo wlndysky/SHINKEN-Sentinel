@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="driver">
+      <UniqueIdentifier>{1A2B3C4D-0001-4000-8000-000000000001}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="runtime">
+      <UniqueIdentifier>{1A2B3C4D-0002-4000-8000-000000000002}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="wfp">
+      <UniqueIdentifier>{1A2B3C4D-0003-4000-8000-000000000003}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="rules">
+      <UniqueIdentifier>{1A2B3C4D-0004-4000-8000-000000000004}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="packet">
+      <UniqueIdentifier>{1A2B3C4D-0005-4000-8000-000000000005}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="control">
+      <UniqueIdentifier>{1A2B3C4D-0006-4000-8000-000000000006}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="telemetry">
+      <UniqueIdentifier>{1A2B3C4D-0007-4000-8000-000000000007}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="package">
+      <UniqueIdentifier>{1A2B3C4D-0008-4000-8000-000000000008}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\driver\driver.c"><Filter>driver</Filter></ClCompile>
+    <ClCompile Include="..\driver\device.c"><Filter>driver</Filter></ClCompile>
+    <ClCompile Include="..\runtime\runtime.c"><Filter>runtime</Filter></ClCompile>
+    <ClCompile Include="..\runtime\rundown.c"><Filter>runtime</Filter></ClCompile>
+    <ClCompile Include="..\runtime\lifecycle.c"><Filter>runtime</Filter></ClCompile>
+    <ClCompile Include="..\telemetry\event_queue.c"><Filter>telemetry</Filter></ClCompile>
+    <ClCompile Include="..\rules\rule_match.c"><Filter>rules</Filter></ClCompile>
+    <ClCompile Include="..\rules\rule_store.c"><Filter>rules</Filter></ClCompile>
+    <ClCompile Include="..\rules\rule_engine.c"><Filter>rules</Filter></ClCompile>
+    <ClCompile Include="..\control\ioctl.c"><Filter>control</Filter></ClCompile>
+    <ClCompile Include="..\wfp\wfp_guids.c"><Filter>wfp</Filter></ClCompile>
+    <ClCompile Include="..\wfp\wfp_objects.c"><Filter>wfp</Filter></ClCompile>
+    <ClCompile Include="..\wfp\wfp_callouts.c"><Filter>wfp</Filter></ClCompile>
+    <ClCompile Include="..\wfp\wfp_manager.c"><Filter>wfp</Filter></ClCompile>
+    <ClCompile Include="..\packet\classify.c"><Filter>packet</Filter></ClCompile>
+    <ClCompile Include="..\packet\injection.c"><Filter>packet</Filter></ClCompile>
+    <ClCompile Include="..\packet\flow_context.c"><Filter>packet</Filter></ClCompile>
+    <ClCompile Include="..\packet\packet_helpers.c"><Filter>packet</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\driver\driver.h"><Filter>driver</Filter></ClInclude>
+    <ClInclude Include="..\runtime\runtime.h"><Filter>runtime</Filter></ClInclude>
+    <ClInclude Include="..\runtime\rundown.h"><Filter>runtime</Filter></ClInclude>
+    <ClInclude Include="..\runtime\lifecycle.h"><Filter>runtime</Filter></ClInclude>
+    <ClInclude Include="..\telemetry\event_queue.h"><Filter>telemetry</Filter></ClInclude>
+    <ClInclude Include="..\rules\rule_types.h"><Filter>rules</Filter></ClInclude>
+    <ClInclude Include="..\rules\rule_store.h"><Filter>rules</Filter></ClInclude>
+    <ClInclude Include="..\rules\rule_engine.h"><Filter>rules</Filter></ClInclude>
+    <ClInclude Include="..\control\protocol.h"><Filter>control</Filter></ClInclude>
+    <ClInclude Include="..\control\ioctl.h"><Filter>control</Filter></ClInclude>
+    <ClInclude Include="..\wfp\wfp_guids.h"><Filter>wfp</Filter></ClInclude>
+    <ClInclude Include="..\wfp\wfp_objects.h"><Filter>wfp</Filter></ClInclude>
+    <ClInclude Include="..\wfp\wfp_callouts.h"><Filter>wfp</Filter></ClInclude>
+    <ClInclude Include="..\wfp\wfp_manager.h"><Filter>wfp</Filter></ClInclude>
+    <ClInclude Include="..\packet\classify.h"><Filter>packet</Filter></ClInclude>
+    <ClInclude Include="..\packet\injection.h"><Filter>packet</Filter></ClInclude>
+    <ClInclude Include="..\packet\flow_context.h"><Filter>packet</Filter></ClInclude>
+    <ClInclude Include="..\packet\packet_helpers.h"><Filter>packet</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="shinken_wfp.inf"><Filter>package</Filter></None>
+    <None Include="guid_registry.json"><Filter>package</Filter></None>
+    <None Include="README_WDK.md"><Filter>package</Filter></None>
+  </ItemGroup>
+</Project>

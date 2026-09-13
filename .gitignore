@@ -1,0 +1,52 @@
+# Local build and test output
+tests/*.exe
+tests/shinkenctl/*.exe
+tests/shinkenctl/build/
+tools/__pycache__/
+wdk/build/
+out/
+!out/.gitkeep
+
+# Native and WDK artifacts
+*.obj
+*.iobj
+*.ipdb
+*.pdb
+*.ilk
+*.sys
+*.cat
+*.cer
+*.dll
+*.lib
+*.exp
+*.res
+*.tlog/
+
+# Packages, deployment bundles and local tools
+deploy/
+package/
+out/package/
+signtool.exe
+infverif.exe
+
+# Kernel debugging and crash material
+*.dmp
+*.dump
+out/dumps/
+dumps/
+
+# Local reports and machine-specific evidence
+environment.txt
+VERIFICATION_REPORT.txt
+REAL_KERNEL_VALIDATION_*.md
+*_environment.txt
+*_verification_report.txt
+
+# Editor and OS metadata
+.vs/
+.vscode/
+*.user
+*.suo
+*.swp
+Thumbs.db
+Desktop.ini

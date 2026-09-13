@@ -1,0 +1,33 @@
+{
+  "profile": "test-2026-09-12",
+  "profileKind": "test",
+  "warning": "These are TEST GUIDs generated as a test profile via the Windows GUID generator for the SHINKEN WFP Demo. They are NOT production-signature product GUIDs. Do not mix test and production GUIDs; regenerate the whole profile together (wfp/wfp_guids.h + this file + wdk/shinken_wfp.inf) in a single commit when cutting a production identity.",
+  "singleDefinitionPoint": "wfp/wfp_guids.h (DEFINE_GUID; real-WDK entity emitted by wfp/wfp_guids.c via <initguid.h>)",
+  "service": {
+    "serviceName": "ShinkenWfp",
+    "displayName": "SHINKEN WFP Demo Driver",
+    "deviceName": "\\Device\\ShinkenWfp",
+    "symbolicLink": "\\??\\ShinkenWfp",
+    "userModePath": "\\\\.\\ShinkenWfp",
+    "sddl": "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)",
+    "startType": "demand",
+    "driverType": "KMDF non-PnP kernel driver",
+    "kmdfTargetVersion": "1.25"
+  },
+  "guids": [
+    { "name": "g_SkProviderKey", "kind": "wfp-provider", "guid": "{471B9041-60C8-4000-89AB-0F99B70495BE}", "usedBy": ["wfp/wfp_manager.c", "wfp/wfp_objects.c", "wdk/shinken_wfp.inf"] },
+    { "name": "g_SkSubLayerKey", "kind": "wfp-sublayer", "guid": "{A0EE102A-514E-48CA-A435-225A4D303CB0}", "usedBy": ["wfp/wfp_manager.c", "wfp/wfp_objects.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_CALLOUT_ALE_AUTH_CONNECT_V4", "kind": "wfp-callout", "layer": "FWPM_LAYER_ALE_AUTH_CONNECT_V4", "guid": "{9087874C-8FA9-4F56-B426-4574E117BD1F}", "usedBy": ["wfp/wfp_callouts.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_CALLOUT_ALE_AUTH_CONNECT_V6", "kind": "wfp-callout", "layer": "FWPM_LAYER_ALE_AUTH_CONNECT_V6", "guid": "{9679CB37-AB39-4AD6-B812-B863C43BA8A0}", "usedBy": ["wfp/wfp_callouts.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_CALLOUT_ALE_RECV_ACCEPT_V4", "kind": "wfp-callout", "layer": "FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4", "guid": "{1B8647F8-9E64-45EC-89F6-F24B71707B51}", "usedBy": ["wfp/wfp_callouts.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_CALLOUT_ALE_RECV_ACCEPT_V6", "kind": "wfp-callout", "layer": "FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6", "guid": "{1DB4282C-A9AB-4E2B-B2CD-353639C143BD}", "usedBy": ["wfp/wfp_callouts.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_CALLOUT_FLOW_ESTABLISHED_V4", "kind": "wfp-callout", "layer": "FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4", "guid": "{E5FB640F-6FFC-42DF-A0A3-E0A9535C10F8}", "usedBy": ["wfp/wfp_callouts.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_CALLOUT_FLOW_ESTABLISHED_V6", "kind": "wfp-callout", "layer": "FWPM_LAYER_ALE_FLOW_ESTABLISHED_V6", "guid": "{350E9656-B326-43E4-8B6E-59039192D400}", "usedBy": ["wfp/wfp_callouts.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_FILTER_ALE_AUTH_CONNECT_V4", "kind": "wfp-filter", "layer": "FWPM_LAYER_ALE_AUTH_CONNECT_V4", "guid": "{947CC9EA-2435-45E9-BD6B-41EC15D82355}", "usedBy": ["wfp/wfp_callouts.c", "wfp/wfp_objects.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_FILTER_ALE_AUTH_CONNECT_V6", "kind": "wfp-filter", "layer": "FWPM_LAYER_ALE_AUTH_CONNECT_V6", "guid": "{AA02A16F-FFDB-4154-B860-03999D032CA5}", "usedBy": ["wfp/wfp_callouts.c", "wfp/wfp_objects.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_FILTER_ALE_RECV_ACCEPT_V4", "kind": "wfp-filter", "layer": "FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4", "guid": "{27FCF1B3-CF86-4532-AAE6-87E98842E400}", "usedBy": ["wfp/wfp_callouts.c", "wfp/wfp_objects.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_FILTER_ALE_RECV_ACCEPT_V6", "kind": "wfp-filter", "layer": "FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6", "guid": "{D622F799-5D79-411F-9331-FD3CF45FCDF0}", "usedBy": ["wfp/wfp_callouts.c", "wfp/wfp_objects.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_FILTER_FLOW_ESTABLISHED_V4", "kind": "wfp-filter", "layer": "FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4", "guid": "{474719F0-8148-43EC-9111-2B7BE6BA679E}", "usedBy": ["wfp/wfp_callouts.c", "wfp/wfp_objects.c", "wdk/shinken_wfp.inf"] },
+    { "name": "SK_FILTER_FLOW_ESTABLISHED_V6", "kind": "wfp-filter", "layer": "FWPM_LAYER_ALE_FLOW_ESTABLISHED_V6", "guid": "{B5667965-A574-436F-9358-22CD55117219}", "usedBy": ["wfp/wfp_callouts.c", "wfp/wfp_objects.c", "wdk/shinken_wfp.inf"] }
+  ]
+}

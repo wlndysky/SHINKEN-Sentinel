@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    shinken_wfp.vcxproj — SHINKEN WFP Demo 真实 WDK 工程(KMDF Non-PnP, x64)
+    与 shim/LLVM 构建完全分离: 本工程不使用 shim 头文件, 强制包含真实 WDK
+    头(ntddk.h;ndis.h;fwpsk.h;fwpmk.h;wdf.h, 见 shinken_wfp.props)。
+    前置: Visual Studio (C++) + WDK 10.0.26100.x + WindowsKernelModeDriver10.0 工具集。
+  -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <!-- 签名是独立的、需用户确认的门控步骤(见 README_WDK.md); 工具集默认
+       SignTask 不带 /fd 会报错, 显式关闭。 -->
+  <PropertyGroup>
+    <SignMode>Off</SignMode>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{7E2C0A1B-5F4D-4C8E-9A21-3B7D6E50C9AA}</ProjectGuid>
+    <RootNamespace>shinken_wfp</RootNamespace>
+    <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
+    <Configuration Condition="'$(Configuration)'==''">Release</Configuration>
+    <Platform Condition="'$(Platform)'==''">x64</Platform>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>KMDF</DriverType>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
+    <KMDF_VERSION_MINOR>25</KMDF_VERSION_MINOR>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>KMDF</DriverType>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
+    <KMDF_VERSION_MINOR>25</KMDF_VERSION_MINOR>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+    <Import Project="shinken_wfp.props" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+
+  <!-- 产物布局: wdk\build\<Configuration>\(.sys/.pdb/.inf/.cat) -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <OutDir>$(ProjectDir)build\Debug\</OutDir>
+    <IntDir>$(ProjectDir)build\Debug\obj\</IntDir>
+    <TargetName>shinken_wfp</TargetName>
+    <TargetExt>.sys</TargetExt>
+    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(ProjectDir)build\Release\</OutDir>
+    <IntDir>$(ProjectDir)build\Release\obj\</IntDir>
+    <TargetName>shinken_wfp</TargetName>
+    <TargetExt>.sys</TargetExt>
+    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <RunCodeAnalysis>true</RunCodeAnalysis>
+      <CodeAnalysisRuleSet>NativeRecommendedRules.ruleset</CodeAnalysisRuleSet>
+      <PreprocessorDefinitions>POOL_NX_OPTIN=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(DDK_LIB_PATH)fwpkclnt.lib;$(DDK_LIB_PATH)ndis.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <RunCodeAnalysis>true</RunCodeAnalysis>
+      <CodeAnalysisRuleSet>NativeRecommendedRules.ruleset</CodeAnalysisRuleSet>
+      <PreprocessorDefinitions>POOL_NX_OPTIN=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(DDK_LIB_PATH)fwpkclnt.lib;$(DDK_LIB_PATH)ndis.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- 现代核心源文件(显式列出) -->
+  <ItemGroup>
+    <ClCompile Include="..\driver\driver.c" />
+    <ClCompile Include="..\driver\device.c" />
+    <ClCompile Include="..\runtime\runtime.c" />
+    <ClCompile Include="..\runtime\rundown.c" />
+    <ClCompile Include="..\runtime\lifecycle.c" />
+    <ClCompile Include="..\telemetry\event_queue.c" />
+    <ClCompile Include="..\rules\rule_match.c" />
+    <ClCompile Include="..\rules\rule_store.c" />
+    <ClCompile Include="..\rules\rule_engine.c" />
+    <ClCompile Include="..\control\ioctl.c" />
+    <ClCompile Include="..\wfp\wfp_guids.c">
+      <!-- 本 TU 在 initguid.h 之前不得包含 fwpsk/fwpmk(否则 include guard
+           使 INITGUID 失效, FWPM_* GUID 无法实体化 —— 内核无独立 lib 提供
+           FWPM_LAYER_* 定义, 标准做法是单 TU initguid + fwpsk/fwpmk) -->
+      <ForcedIncludeFiles>warning.h;ntddk.h;ndis.h</ForcedIncludeFiles>
+    </ClCompile>
+    <ClCompile Include="..\wfp\wfp_objects.c" />
+    <ClCompile Include="..\wfp\wfp_callouts.c" />
+    <ClCompile Include="..\wfp\wfp_manager.c" />
+    <ClCompile Include="..\packet\classify.c" />
+    <ClCompile Include="..\packet\injection.c" />
+    <ClCompile Include="..\packet\flow_context.c" />
+    <ClCompile Include="..\packet\packet_helpers.c" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="..\driver\driver.h" />
+    <ClInclude Include="..\runtime\sk_atomic.h" />
+    <ClInclude Include="..\runtime\runtime.h" />
+    <ClInclude Include="..\runtime\rundown.h" />
+    <ClInclude Include="..\runtime\lifecycle.h" />
+    <ClInclude Include="..\telemetry\event_queue.h" />
+    <ClInclude Include="..\rules\rule_store.h" />
+    <ClInclude Include="..\rules\rule_engine.h" />
+    <ClInclude Include="..\control\protocol.h" />
+    <ClInclude Include="..\control\ioctl.h" />
+    <ClInclude Include="..\rules\rule_types.h" />
+    <ClInclude Include="..\wfp\wfp_guids.h" />
+    <ClInclude Include="..\wfp\wfp_objects.h" />
+    <ClInclude Include="..\wfp\wfp_callouts.h" />
+    <ClInclude Include="..\wfp\wfp_manager.h" />
+    <ClInclude Include="..\packet\classify.h" />
+    <ClInclude Include="..\packet\injection.h" />
+    <ClInclude Include="..\packet\flow_context.h" />
+    <ClInclude Include="..\packet\packet_helpers.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="shinken_wfp.inf" />
+    <None Include="guid_registry.json" />
+    <None Include="README_WDK.md" />
+  </ItemGroup>
+
+  <!-- INF 处理 + 目录签名文件(.cat)生成: stampinf 盖日期/版本, Inf2Cat 产 cat。
+       测试签名(signtool)与安装是独立的、需用户确认的门控步骤, 不在本工程内自动执行。 -->
+  <Target Name="ShinkenDriverPackage" AfterTargets="Build">
+    <!-- WDKBinRoot 可能带或不带尾斜杠(工具集设置为不带); 统一为带尾斜杠 -->
+    <PropertyGroup>
+      <_ShkWdkBin>$(WDKBinRoot)</_ShkWdkBin>
+      <_ShkWdkBin Condition="!$([System.String]::Copy('$(_ShkWdkBin)').EndsWith('\'))">$(_ShkWdkBin)\</_ShkWdkBin>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_ShkWdkBin)x86\stampinf.exe')"
+           Text="stampinf.exe not found under '$(_ShkWdkBin)x86'. Install WDK 10.0.26100 or set WDKBinRoot (see wdk/README_WDK.md)." />
+    <Error Condition="!Exists('$(_ShkWdkBin)x86\Inf2Cat.exe')"
+           Text="Inf2Cat.exe not found under '$(_ShkWdkBin)x86'. Install WDK 10.0.26100 or set WDKBinRoot (see wdk/README_WDK.md)." />
+    <Copy SourceFiles="shinken_wfp.inf" DestinationFiles="$(OutDir)shinken_wfp.inf" />
+    <Exec Command="&quot;$(_ShkWdkBin)x86\stampinf.exe&quot; -f &quot;$(OutDir)shinken_wfp.inf&quot; -d &quot;*&quot; -v &quot;1.0.0.0&quot;" />
+    <Exec Command="&quot;$(_ShkWdkBin)x86\Inf2Cat.exe&quot; /driver:&quot;$(OutDir).&quot; /os:&quot;10_X64&quot; /uselocaltime" />
+  </Target>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

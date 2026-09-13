@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    shinken_wfp.props — 共享属性表(Debug/Release 通用)
+    * 强制包含真实 WDK 头(与 shim 构建的 -include 机制对应, 但指向真 WDK):
+      ntddk.h;ndis.h;fwpsk.h;fwpmk.h;wdf.h —— 顺序保证 ntddk 先于 wdf.h。
+    * NDIS_WDM: ndis.h 的驱动模型选择宏(KMDF/WDM 驱动必须定义, 否则
+      NDIS_SUPPORT_NDIS6 关闭, ndis/nbl.h(NET_BUFFER_LIST)不进编译,
+      fwpsk.h 随之语法失败 —— 首轮真实编译 C2143/C2370 根因)。
+    * W4/WX 只约束项目代码: WDK 头非 /W4-clean(C4201 等), 经
+      /external:anglebrackets + ExternalWarningLevel=Level3 降为 W3;
+      项目头全部用 "" 包含, 保持 /W4/WX。
+    * 定义 SHINKEN_HOST_SHIM 仅在 shim/LLVM 构建设置(build.bat/run_tests.bat),
+      本工程不得定义该宏 —— 出现即说明 include 路径配错。
+    * WDKBinRoot: 供 stampinf/Inf2Cat 定位; 依次回退到 WDKContentRoot 与
+      默认安装路径(WDK 10.0.26100.0)。
+  -->
+  <ImportGroup Label="PropertySheets" />
+
+  <PropertyGroup>
+    <WDKContentRoot Condition="'$(WDKContentRoot)'==''">$(MSBuildProgramFiles32)\Windows Kits\10\</WDKContentRoot>
+    <WDKBinRoot Condition="'$(WDKBinRoot)'=='' and Exists('$(WDKContentRoot)bin\10.0.26100.0\x86\stampinf.exe')">$(WDKContentRoot)bin\10.0.26100.0\</WDKBinRoot>
+    <WDKBinRoot Condition="'$(WDKBinRoot)'==''">$(WDKContentRoot)bin\</WDKBinRoot>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- 真实 WDK 头基座(替代 shim 的 -include shim\wdk_shim.h / wfp_layers.h) -->
+      <ForcedIncludeFiles>warning.h;ntddk.h;ndis.h;fwpsk.h;fwpmk.h;wdf.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>
+      <PreprocessorDefinitions>NDIS_WDM;NDIS630;POOL_NX_OPTIN=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- WDK 头按 W3(external), 项目代码保持 W4/WX -->
+      <ExternalWarningLevel>Level3</ExternalWarningLevel>
+      <AdditionalOptions>/external:anglebrackets /utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>

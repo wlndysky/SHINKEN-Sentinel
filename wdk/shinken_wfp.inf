@@ -1,0 +1,88 @@
+;
+; shinken_wfp.inf — SHINKEN WFP Demo KMDF Non-PnP 驱动安装文件(测试用途)
+;
+; 统一身份(与 wfp/wfp_guids.h / wdk/guid_registry.json / driver/device.c 一致):
+;   服务名     : ShinkenWfp
+;   设备名     : \Device\ShinkenWfp (符号链接 \??\ShinkenWfp, 用户态 \\.\ShinkenWfp)
+;   设备接口   : 无 —— 非 PnP 控制设备无 PDO, 无法注册设备接口(真实内核验证)
+;   设备 SDDL  : D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)  (driver/device.c)
+;   GUID 档位  : test-2026-09-12 (测试 GUID, 非生产)
+;
+; 前置门: infverif 通过 + 测试签名(用户确认) + VM 快照 之后方可安装。
+; 非 PnP 说明: 本 INF 无硬件型号段; pnputil /add-driver 仅负责入 driver store,
+; 服务创建经 InstallHinfSection DefaultInstall(见 wdk/README_WDK.md)。
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderName%
+DriverVer   =
+CatalogFile = shinken_wfp.cat
+PnpLockdown = 1
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+shinken_wfp.sys = 1,,
+
+[DestinationDirs]
+DefaultDestDir = 12
+ShinkenWfp.DriverFiles = 12
+
+;*************************************************************************
+; DefaultInstall(primitive driver: 非 PnP 软件驱动, 无硬件型号段;
+; [Manufacturer] 与 [DefaultInstall] 不可共存 —— infverif 1212/1297)
+;*************************************************************************
+
+[DefaultInstall.NTamd64]
+CopyFiles = ShinkenWfp.DriverFiles
+
+[ShinkenWfp.DriverFiles]
+shinken_wfp.sys
+
+[DefaultInstall.NTamd64.Services]
+AddService = ShinkenWfp,%SPSVCINST_ASSOCSERVICE%,ShinkenWfp.Service
+
+[ShinkenWfp.Service]
+DisplayName    = %ServiceDisplayName%
+Description    = %ServiceDescription%
+ServiceType    = 1    ; SERVICE_KERNEL_DRIVER
+StartType      = 3    ; SERVICE_DEMAND_START
+ErrorControl   = 1    ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\shinken_wfp.sys
+AddReg         = ShinkenWfp.Service.AddReg
+
+[DefaultInstall.NTamd64.Wdf]
+KmdfService = ShinkenWfp, ShinkenWfp.Kmdf
+
+[ShinkenWfp.Kmdf]
+KmdfLibraryVersion = 1.25
+
+[ShinkenWfp.Service.AddReg]
+; WFP 身份登记(诊断/核查; 值必须与 wfp/wfp_guids.h 同步, 一次提交完成)
+HKR,Parameters\Wfp,"GuidProfile",0x00000000,"test-2026-09-12"
+HKR,Parameters\Wfp,"ProviderKey",0x00000000,"{471B9041-60C8-4000-89AB-0F99B70495BE}"
+HKR,Parameters\Wfp,"SubLayerKey",0x00000000,"{A0EE102A-514E-48CA-A435-225A4D303CB0}"
+HKR,Parameters\Wfp,"CalloutAleAuthConnectV4",0x00000000,"{9087874C-8FA9-4F56-B426-4574E117BD1F}"
+HKR,Parameters\Wfp,"CalloutAleAuthConnectV6",0x00000000,"{9679CB37-AB39-4AD6-B812-B863C43BA8A0}"
+HKR,Parameters\Wfp,"CalloutAleRecvAcceptV4",0x00000000,"{1B8647F8-9E64-45EC-89F6-F24B71707B51}"
+HKR,Parameters\Wfp,"CalloutAleRecvAcceptV6",0x00000000,"{1DB4282C-A9AB-4E2B-B2CD-353639C143BD}"
+HKR,Parameters\Wfp,"CalloutFlowEstablishedV4",0x00000000,"{E5FB640F-6FFC-42DF-A0A3-E0A9535C10F8}"
+HKR,Parameters\Wfp,"CalloutFlowEstablishedV6",0x00000000,"{350E9656-B326-43E4-8B6E-59039192D400}"
+HKR,Parameters\Wfp,"FilterAleAuthConnectV4",0x00000000,"{947CC9EA-2435-45E9-BD6B-41EC15D82355}"
+HKR,Parameters\Wfp,"FilterAleAuthConnectV6",0x00000000,"{AA02A16F-FFDB-4154-B860-03999D032CA5}"
+HKR,Parameters\Wfp,"FilterAleRecvAcceptV4",0x00000000,"{27FCF1B3-CF86-4532-AAE6-87E98842E400}"
+HKR,Parameters\Wfp,"FilterAleRecvAcceptV6",0x00000000,"{D622F799-5D79-411F-9331-FD3CF45FCDF0}"
+HKR,Parameters\Wfp,"FilterFlowEstablishedV4",0x00000000,"{474719F0-8148-43EC-9111-2B7BE6BA679E}"
+HKR,Parameters\Wfp,"FilterFlowEstablishedV6",0x00000000,"{B5667965-A574-436F-9358-22CD55117219}"
+
+
+[Strings]
+ProviderName             = "SHINKEN Demo (test)"
+DiskId1                  = "SHINKEN WFP Demo Installation Media"
+ServiceDisplayName       = "SHINKEN WFP Demo Driver"
+ServiceDescription       = "SHINKEN WFP Demo - WFP rule engine test driver (non-production, test GUID profile)"
+SPSVCINST_ASSOCSERVICE   = 0x00000002
