@@ -10,8 +10,14 @@
 //     dispatch body live in control/ioctl.c.
 //
 // SDDL: D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)
-//   — SYSTEM/Administrators full control (GA), others generic read (GR);
-//   write commands are re-authorized (privileged check) by ioctl.c at create.
+//   — SYSTEM/Administrators full control (GA), others generic read (GR).
+// Privilege model (design note lives in control/ioctl.c): modify commands are
+// re-authorized at handle-create and cached as a handle-scoped capability;
+// this SDDL is the primary boundary and the per-handle cache is defense in
+// depth. The GR-to-WD (Everyone) leg is a deliberate query/telemetry surface
+// (capabilities/rule metadata/stats/event records are readable by any local
+// process): it is NOT a confidentiality boundary, and no secret material may
+// ride in query payloads.
 // ============================================================================
 #include <ntddk.h>
 #include <wdf.h>

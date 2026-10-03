@@ -9,15 +9,19 @@
 extern "C" {
 #endif
 
-// Per-handle context (KMDF file-object attachment): privilege flag + counted pairing
+// Per-handle context (KMDF file-object attachment): privilege flag + counted pairing.
+// `counted` is set ONLY after the handle-create gate (ShRundown, see ioctl.c)
+// accepted the create; EvtFileDestroy pairs ShHandleClose exactly when counted.
 typedef struct _SK_IOCTL_CONTEXT {
-    BOOLEAN privileged;   // determined at create (LocalSystem/Administrators)
+    BOOLEAN privileged;   // handle-scoped capability: LocalSystem/Administrators, decided at create
     BOOLEAN counted;      // ShHandleOpen paired (destroy decrements on this)
 } SK_IOCTL_CONTEXT;
 
 // Control-plane lifecycle
 NTSTATUS SkControlInit(PDRIVER_OBJECT driverObject);  // build control device/queue/ACL
-BOOLEAN SkControlQuiesce(void);                       // close request gate + wait for handles to drain
+BOOLEAN SkControlQuiesce(void);                       // close request + handle-create gates (ShRundown),
+                                                      // drain in-flight creates, join consumer,
+                                                      // bounded-wait handles==0; TRUE => destroy allowed
 VOID SkControlDestroy(void);                          // delete device (after the gate allows destroy)
 
 // KMDF callback (wired up by driver/device.c)

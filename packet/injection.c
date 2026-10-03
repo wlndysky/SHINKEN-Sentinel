@@ -3,7 +3,7 @@
 // owner)
 //
 // Protocol (contract in injection.h; correctness argument in
-// runtime/rundown.h and docs/UNLOAD_SAFETY.md §2):
+// runtime/rundown.h and runtime/runtime.h):
 //   * an injection path must ShInjectionBegin() (rundown acquire)
 //     before using the handles;
 //   * quiesce: GateStop (stop bit; Begin fails afterwards) -> drain
@@ -42,16 +42,34 @@ HANDLE g_InjectionHandle[2];
 static SHINKEN_WFP_OBJECT g_InjectionTrack[2];
 PVOID g_SkNblPool;
 PVOID g_SkNbPool;
-static LONG g_SkInjectInited;
+static LONG g_SkInjectInited;   // state bit: 1 <=> both handles AND both pools exist (strict pairing)
+static LONG g_SkInjectQuiesced; // set by a fully successful quiesce: the injection
+                                // rundown gate is then permanently stopped, so
+                                // SkInjectInit refuses re-init (provable re-init semantics)
 
 // create injection handles + NBL/NB pools; all return values checked; partial failure rolls back what was built.
+//
+// State-bit discipline (P2 defect fix — must be provable):
+//   g_SkInjectInited==1  <=>  handles[0..1] and pools exist and are usable;
+//   g_SkInjectInited==0  <=>  none of them is relied upon (nothing created, or
+//                             fully quiesced/destroyed, or a failed init that
+//                             rolled everything back).
+// The claim is a single CAS; EVERY failure path below resets the bit to 0
+// after rolling back the resources claimed so far, so the invariant "bit ==
+// resources" holds after any return. A second Init while initialized is a
+// no-op success (idempotent). After a successful quiesce the gate rundown's
+// stop bit is irreversible (rundown.h invariant 7): re-init would create
+// handles behind a permanently closed ShInjectionBegin gate, so it is
+// refused with STATUS_INVALID_DEVICE_STATE and the bit stays 0.
 NTSTATUS SkInjectInit(void) {
     NET_BUFFER_LIST_POOL_PARAMETERS nblParams;
     NET_BUFFER_POOL_PARAMETERS nbParams;
     NTSTATUS st;
 
-    if (SkAtOr32(&g_SkInjectInited, 1))
-        return STATUS_SUCCESS; // idempotent
+    if (SkAtOr32(&g_SkInjectQuiesced, 0))
+        return STATUS_INVALID_DEVICE_STATE; // gate permanently stopped; re-init refused, bit stays 0
+    if (SkAtCas32(&g_SkInjectInited, 1, 0) != 0)
+        return STATUS_SUCCESS; // already initialized: bit==1 => handles+pools exist (invariant below)
 
     ShWfpObjectInit(&g_InjectionTrack[0], "injectHandleV4", 0, 0, NULL);
     ShWfpObjectInit(&g_InjectionTrack[1], "injectHandleV6", 0, 0, NULL);
@@ -115,8 +133,8 @@ BOOLEAN SkInjectQuiesce(void) {
     NTSTATUS st;
     ULONG i;
 
-    if (!g_SkInjectInited)
-        return TRUE; // idempotent: uninitialized = nothing to quiesce
+    if (!SkAtOr32(&g_SkInjectInited, 0))
+        return TRUE; // idempotent: uninitialized = nothing to quiesce (atomic state-bit read)
 
     ShInjectionGateStop();
     st = ShInjectionDrain(SK_INJECT_DRAIN_RETRIES, SK_INJECT_RETRY_DELAY_MS);
@@ -137,6 +155,13 @@ BOOLEAN SkInjectQuiesce(void) {
             return FALSE;
         }
     }
+    // Full success (P2 defect fix): the injection gate is permanently closed
+    // and both handles are destroyed, so "initialized" is no longer true —
+    // reset the state bit to keep bit<->resources strictly paired, and latch
+    // quiesced so a later SkInjectInit is refused instead of silently
+    // creating handles behind the dead gate.
+    SkAtXchg32(&g_SkInjectInited, 0);
+    SkAtXchg32(&g_SkInjectQuiesced, 1);
     return TRUE;
 }
 

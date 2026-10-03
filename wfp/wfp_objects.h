@@ -25,7 +25,11 @@
 // success straight to REGISTERED; teardown is orchestrated by the
 // manager with no dedicated phase) — enum slots kept for future
 // two-phase-commit semantics. QUIESCING has a transition path (set
-// only by SkWfpObjectUnregister).
+// only by SkWfpObjectUnregister). Exception to "create failure =>
+// FAILED": a callout whose FwpsCalloutRegister1 succeeded keeps state
+// REGISTERED even when a later engine-side step (FwpmCalloutAdd0) fails,
+// because the runtime registration (calloutRuntimeId != 0) is still on
+// the books and must be unregistered exactly once.
 // Concurrency: object state transitions only under the manager's
 // install/teardown lock (wfp_manager.c, PASSIVE install/teardown
 // path); diagnostic fields may be read from any context (single-word
@@ -68,7 +72,9 @@ typedef struct _SK_WFP_OBJECT {
     UINT32 calloutId;        // product of FwpmCalloutAdd*
     UINT64 filterId;         // product of FwpmFilterAdd*
     SK_WFP_OBJECT_STATE state;
-    SK_WFP_PHASE phase;      // latest creation phase (rollback deletes only REGISTERED/ACTIVE)
+    SK_WFP_PHASE phase;      // latest creation phase (rollback targets REGISTERED/ACTIVE
+                             // objects AND any runtime registration still on the books:
+                             // calloutRuntimeId != 0 — see SkWfpObjectUnregister)
     NTSTATUS lastStatus;     // last API return value
     ULONG busyRetries;       // BUSY retry count (diagnostic)
 } SK_WFP_OBJECT;
@@ -78,13 +84,30 @@ VOID SkWfpObjectReset(SK_WFP_OBJECT *o, const char *name);
 // Registration-surface operations (all check return values and advance
 // state; same discipline as runtime-layer ShWfp*: unknown error =>
 // Leaked). See wfp/wfp_objects.c.
+//
+// Runtime vs engine state: a callout object carries BOTH a kernel-side
+// runtime registration (FwpsCalloutRegister1 product: calloutRuntimeId)
+// and an engine-side management callout (FwpmCalloutAdd0 product:
+// calloutId). They are torn down by different APIs and must be tracked
+// independently: create-phase failure of one NEVER erases the other —
+// specifically AddCallout failure keeps the runtime registration on the
+// books (state stays REGISTERED, calloutRuntimeId kept) so rollback and
+// teardown always reach FwpsCalloutUnregisterById0 exactly once.
 NTSTATUS SkWfpObjectRegisterCallout(SK_WFP_OBJECT *o, PDEVICE_OBJECT device,
                                     const FWPS_CALLOUT1 *callout); // FwpsCalloutRegister1
 NTSTATUS SkWfpObjectAddCallout(SK_WFP_OBJECT *o, HANDLE engine);   // FwpmCalloutAdd0
 NTSTATUS SkWfpObjectAddFilter(SK_WFP_OBJECT *o, HANDLE engine,
                               const GUID *layerKey, UINT32 layerId);
+// Unregister the runtime callout (bounded BUSY retries). Idempotence is
+// judged by calloutRuntimeId: nonzero => exactly one unregister is owed
+// and will be attempted; zero => already confirmed removed, returns
+// STATUS_SUCCESS. busyCleanup (flow-context strip) runs between BUSY
+// retries and MUST return TRUE only when the strip is confirmed
+// complete; FALSE (or NULL) => nothing left to retry for => LEAKED.
+// Confirmed removal zeroes calloutRuntimeId and sets DELETED; any other
+// outcome sets LEAKED (terminal).
 NTSTATUS SkWfpObjectUnregister(SK_WFP_OBJECT *o, PVOID busyCtx,
-                               VOID (*busyCleanup)(PVOID), ULONG maxBusyRetries,
+                               BOOLEAN (*busyCleanup)(PVOID), ULONG maxBusyRetries,
                                ULONG delayMs);
 NTSTATUS SkWfpObjectDelete(SK_WFP_OBJECT *o, HANDLE engine); // delete by installed part
 

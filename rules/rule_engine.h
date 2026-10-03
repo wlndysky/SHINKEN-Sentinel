@@ -1,6 +1,6 @@
 // ============================================================================
 // rules/rule_engine.h — Rule evaluation (classify hot path) and statistics.
-// Verdict semantics (precedence pinned in rule_types.h; docs/RULE_ENGINE.md):
+// Verdict semantics (precedence pinned in rule_types.h):
 //   scan the snapshot (pre-sorted by priority desc + action strength +
 //   ruleId); the first fully matching enabled rule is the verdict; RATE_LIMIT
 //   consults the token bucket (mutable state outside the snapshot); no match
@@ -25,8 +25,9 @@ extern SK_RULE_STATS g_SkRuleStats;
 VOID SkRuleStatsReset(void);
 
 // RATE_LIMIT state (one entry per rule id; snapshot-independent, lazily
-// cleaned when the rule is removed)
-VOID SkRuleRateReset(UINT64 ruleId); // call on rule delete/disable
+// cleaned when the rule is removed; auto-reset on rate-parameter change)
+VOID SkRuleRateReset(UINT64 ruleId);        // call on rule delete/disable
+VOID SkRuleRateClampBurst(UINT64 ruleId, UINT32 newBurst); // call on burst shrink
 
 #ifdef __cplusplus
 }

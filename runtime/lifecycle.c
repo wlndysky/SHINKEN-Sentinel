@@ -1,6 +1,6 @@
 // ============================================================================
 // runtime/lifecycle.c — subsystem lifecycle orchestration (contract in
-// lifecycle.h; ordering proof in docs/UNLOAD_SAFETY.md §7).
+// lifecycle.h; ordering rationale inline below).
 //
 // Start order (SkLifecycleStart; any step failure rolls back completed steps
 // in reverse):
@@ -22,9 +22,13 @@
 //   3. telemetry stop (ShEventThreadStop: close producer gate + join + drain)
 //   4. injection gate (SkInjectQuiesce: GateStop + drain + destroy handle)
 //   5. BFE unsubscribe + ShRundownBfe BeginStop/Drain (bounded wait)
-//   6. WFP teardown (SkWfpManagerTeardown: callout unregister is the documented
-//      safety point, flow contexts stripped between BUSY retries, then engine
-//      objects deleted + engine closed)
+//   6. WFP teardown (SkWfpManagerTeardown: per callout the flow-attach gate
+//      is closed and in-flight attaches drained BEFORE the callout-unregister
+//      documented safety point; flow contexts are stripped and settled
+//      (bounded) before unregister — the unregister contract forfeits
+//      flowDeleteFn — with busyCleanup stripping between BUSY retries; a
+//      strip that will not settle blocks unload; then engine objects
+//      deleted + engine closed)
 //   7. drain ShRundownWorkItem
 //   8. event-thread final re-check (idempotent)
 // Destroy order (SkLifecycleDestroy, only after ShRuntimeDestroyAllowed):
@@ -33,12 +37,14 @@
 //   immediately) -> SkControlDestroy (delete device). Engine close already
 //   done at teardown (step 6).
 //
-// UNLOAD_BLOCKED policy (demo-only; full argument in docs/UNLOAD_SAFETY.md):
-// any quiesce/rollback failure => runtime enters UNLOAD_BLOCKED and
-// EvtDriverUnload never returns — the image can never be unloaded while any
-// drain failed, so code referenced by WFP/BFE/work-item callbacks stays
-// valid. Cost: sc stop sits in STOP_PENDING until SCM times out. The resident
-// loop holds no locks/resources and can be interrupted at shutdown.
+// UNLOAD_BLOCKED policy (demo-only): any quiesce/rollback failure =>
+// runtime enters UNLOAD_BLOCKED and EvtDriverUnload never returns — the
+// image can never be unloaded while any drain failed, so code referenced
+// by WFP/BFE/work-item callbacks stays valid. The rationale: KMDF has no
+// "refuse unload" result, so the only safe failure policy is not
+// returning. Cost: sc stop sits in STOP_PENDING until SCM times out. The
+// resident loop holds no locks/resources and can be interrupted at
+// shutdown.
 // Diagnosability: ShRuntimeBlockReason (first cause) + g_BlockHistory (all
 // causes) + per-object state/lastStatus/busyRetries.
 //
@@ -181,7 +187,10 @@ BOOLEAN SkLifecycleQuiesce(void) {
     //    callbacks may trigger reinstall; cut the callback source first)
     if (!skBfeQuiesce())
         ok = FALSE;
-    // 6) WFP teardown: unregister all callouts (safety point) + delete engine
+    // 6) WFP teardown: per callout, close the flow-attach gate and drain
+    //    in-flight FwpsFlowAssociateContext0 BEFORE the unregister safe
+    //    point, strip + settle flow contexts before unregister (a strip
+    //    that will not settle blocks unload), then delete engine
     //    objects + close engine; records precise reasons internally
     if (!SkWfpManagerTeardown()) {
         skRecordIfNone(ShinkenBlockEngineClose);
@@ -340,7 +349,8 @@ NTSTATUS SkLifecycleStart(PDRIVER_OBJECT driverObject, PDEVICE_OBJECT wdmDevice)
     g_SkSteps |= SK_STEP_INJECT;
 
     // 4b) flow context table (WFP teardown's BUSY root-cause handling
-    //     SkFlowRemoveAll depends on it; must exist before callouts can attach contexts)
+    //     SkFlowRemoveAll and the per-callout attach gates depend on it;
+    //     must exist before callouts can attach contexts)
     status = SkFlowInit();
     if (status < 0)
         goto rollback;

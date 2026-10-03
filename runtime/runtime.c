@@ -1,6 +1,6 @@
 // ============================================================================
 // runtime/runtime.c — unified runtime state machine / rundown / WFP object
-// tracking (full proof in docs/UNLOAD_SAFETY.md).
+// tracking (full proof inline in lifecycle/runtime headers).
 //
 // Unload policy:
 //   a) All drains complete within bounded retries => QUIESCENT => destroy
@@ -50,7 +50,7 @@ static const char *const g_ReasonNames[] = {
 
 // ---------------------------------------------------------------------------
 // Kernel default ops table (IR build; host-test build provides and overrides
-// the whole ShOps in tests/)
+// the whole ShOps table externally)
 #ifndef SHINKEN_HOST_TEST
 static NTSTATUS shkUnregById(UINT32 id) { return FwpsCalloutUnregisterById0(id); }
 static NTSTATUS shkUnregByKey(const GUID *key) { return FwpsCalloutUnregisterByKey0(key); }

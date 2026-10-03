@@ -24,6 +24,15 @@ Shinken Sentinel 不以堆叠规则为目标，而是试图回答一个更基础
 
 部分能力仍未接通：重定向、内容检查和数据包注入提交路径尚未实现；接口索引与用户 SID 条件仅保留协议标识，规则验证会拒绝使用这些条件。
 
+### 研究限制
+
+- 限流桶表固定 64 槽。当 RATE_LIMIT 规则数量超过 64 个时，表满后的新 RATE_LIMIT 规则会退化为放行（fail-open），这是 demo 规模限制，不属于生产级限流语义。
+- appId 匹配使用 ASCII-only FNV 哈希的路径归一化，存在哈希碰撞且不处理国际化、大小写之外的 Windows 路径语义，不能作为生产级 Windows 身份匹配依据。
+
+### 权限模型与查询面
+
+控制面采用 create-time handle-scoped capability 模型：特权判定在 `IRP_MJ_CREATE` 时于创建者进程上下文执行一次，结果缓存到 KMDF file-object 上下文；后续 modify 命令检查该缓存标志。这避免了在专用 consumer 线程中每请求鉴权时错误地拿到 SYSTEM 令牌的问题。能力绑定在句柄对象上，因此 `DuplicateHandle` 或句柄继承会把 modify 能力传递给接收方，且创建后令牌组成员变化不会立即生效。SDDL 授予 Everyone 泛读权限，规则版本、枚举、统计、事件等查询命令使用 `FILE_ANY_ACCESS`，属于设计内的可观测性/诊断暴露面，不应被视为完整机密性边界。
+
 ## 模块
 
 | 目录 | 职责 |

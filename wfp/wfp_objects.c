@@ -69,7 +69,12 @@ NTSTATUS SkWfpObjectRegisterCallout(SK_WFP_OBJECT *o, PDEVICE_OBJECT device,
 
 // FwpmCalloutAdd0: engine-side management object. Success => calloutId
 // set (state stays REGISTERED; the manager sets ACTIVE once a filter is
-// attached). Failure => FAILED.
+// attached). Failure => calloutId cleared; the engine-side object does
+// not exist, but a successful FwpsCalloutRegister1 (calloutRuntimeId !=
+// 0) is a separate fact on a separate surface — it is kept and the state
+// stays REGISTERED so rollback/teardown still run
+// FwpsCalloutUnregisterById0 exactly once. state=Failed only when nothing
+// at all is on the books.
 NTSTATUS SkWfpObjectAddCallout(SK_WFP_OBJECT *o, HANDLE engine) {
     FWPM_CALLOUT0 mc;
     const SK_CALLOUT_DEF *def;
@@ -78,7 +83,8 @@ NTSTATUS SkWfpObjectAddCallout(SK_WFP_OBJECT *o, HANDLE engine) {
     def = skWfpDefByCalloutKey(&o->key);
     if (def == NULL) { // key not in the layer table: internal consistency error
         o->lastStatus = STATUS_INVALID_PARAMETER;
-        o->state = SkWfpStateFailed;
+        if (o->calloutRuntimeId == 0)
+            o->state = SkWfpStateFailed; // runtime registration also absent: nothing on the books
         return o->lastStatus;
     }
     RtlZeroMemory(&mc, sizeof(mc));
@@ -92,8 +98,11 @@ NTSTATUS SkWfpObjectAddCallout(SK_WFP_OBJECT *o, HANDLE engine) {
     st = FwpmCalloutAdd0(engine, &mc, NULL, &o->calloutId);
     o->lastStatus = st;
     if (!NT_SUCCESS(st)) {
-        o->calloutId = 0;
-        o->state = SkWfpStateFailed;
+        o->calloutId = 0; // engine-side add failed: no mgmt callout exists
+        if (o->calloutRuntimeId == 0)
+            o->state = SkWfpStateFailed; // and no runtime registration: full create failure
+        // else: runtime registration (calloutRuntimeId) still held — the
+        // unregister is owed later; FAILED here would orphan it.
     }
     return st;
 }
@@ -102,6 +111,16 @@ NTSTATUS SkWfpObjectAddCallout(SK_WFP_OBJECT *o, HANDLE engine) {
 // CALLOUT_TERMINATING pointing at this layer's callout. Success =>
 // filterId set + REGISTERED (arbitration callbacks active); failure =>
 // FAILED.
+//
+// FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT is declared so that at run time
+// FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT reaches the matched FWPS_FILTER1
+// and a PERMIT written by this callout is final (packet/classify.c
+// clears FWPS_RIGHT_ACTION_WRITE on PERMIT only when the filter carries
+// that flag; without it the write right must survive for lower-priority
+// sublayers).
+#ifndef FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
+#define FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT 0x00000008u // fwpmk.h
+#endif
 NTSTATUS SkWfpObjectAddFilter(SK_WFP_OBJECT *o, HANDLE engine,
                               const GUID *layerKey, UINT32 layerId) {
     FWPM_FILTER0 f;
@@ -116,6 +135,7 @@ NTSTATUS SkWfpObjectAddFilter(SK_WFP_OBJECT *o, HANDLE engine,
     }
     RtlZeroMemory(&f, sizeof(f));
     f.displayData.name = SK_WFP_FILTER_NAME_W; // BFE requires non-empty (as above)
+    f.flags = FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT;
     f.filterKey = *def->filterKey;  // explicit key (wfp_guids.h): diagnosable / verifiable by key
     f.layerKey = *layerKey;
     // Explicit high weight: FWP_EMPTY auto-weight is too low and a
@@ -142,17 +162,31 @@ NTSTATUS SkWfpObjectAddFilter(SK_WFP_OBJECT *o, HANDLE engine,
 // FwpsCalloutUnregisterById0 with bounded BUSY retries (same discipline
 // as ShWfpUnregisterCalloutById): after a successful return, WFP
 // guarantees classifyFn/notifyFn/flowDeleteFn are no longer called
-// (documented safe point). Each BUSY round first runs
-// busyCleanup(busyCtx) to strip flow contexts (root cause). Unknown
-// error / exhausted => LEAKED (terminal).
+// (documented safe point).
+//
+// Runtime-registration fact vs object state: the unregister obligation is
+// judged by calloutRuntimeId, not by state — a create-phase failure of a
+// LATER step (FwpmCalloutAdd0) leaves the runtime registration on the
+// books while the state says REGISTERED/FAILED variants; only a
+// confirmed removal (or a never-registered id of 0) ends the obligation.
+// Exactly-once: confirmed removal zeroes calloutRuntimeId, and only the
+// nonzero->confirmed transition performs the unregister.
+//
+// BUSY handling: each retry round first runs busyCleanup(busyCtx) to
+// strip flow contexts (root cause). busyCleanup returns TRUE only when
+// the strip is CONFIRMED complete; FALSE (or NULL) means the BUSY root
+// cause could not be removed — there is nothing left to retry for, so
+// the object parks as LEAKED instead of burning retries that must fail.
+// Unknown error / exhausted => LEAKED (terminal).
 NTSTATUS SkWfpObjectUnregister(SK_WFP_OBJECT *o, PVOID busyCtx,
-                               VOID (*busyCleanup)(PVOID), ULONG maxBusyRetries,
+                               BOOLEAN (*busyCleanup)(PVOID), ULONG maxBusyRetries,
                                ULONG delayMs) {
     NTSTATUS st;
     ULONG attempt;
 
-    if (o->state == SkWfpStateDeleted || o->state == SkWfpStateUninitialized)
-        return STATUS_SUCCESS; // idempotent: no longer registered
+    if (o->calloutRuntimeId == 0 || o->state == SkWfpStateDeleted ||
+        o->state == SkWfpStateUninitialized)
+        return STATUS_SUCCESS; // idempotent: no runtime registration on the books
     if (o->state == SkWfpStateLeaked)
         return STATUS_DEVICE_BUSY; // terminal state: never touch again
     o->state = SkWfpStateQuiescing;
@@ -161,6 +195,7 @@ NTSTATUS SkWfpObjectUnregister(SK_WFP_OBJECT *o, PVOID busyCtx,
         o->lastStatus = st;
         if (st == STATUS_SUCCESS || st == FWP_E_CALLOUT_NOT_FOUND) {
             // NOT_FOUND = documented "not registered", equivalent to success: confirmed removed
+            o->calloutRuntimeId = 0; // confirmed: the unregister obligation is spent
             o->state = SkWfpStateDeleted;
             o->busyRetries = attempt;
             return st;
@@ -175,8 +210,13 @@ NTSTATUS SkWfpObjectUnregister(SK_WFP_OBJECT *o, PVOID busyCtx,
             o->state = SkWfpStateLeaked; // BUSY retries exhausted => park
             return st;
         }
-        if (busyCleanup)
-            busyCleanup(busyCtx); // strip flow contexts first each round (BUSY root cause)
+        if (busyCleanup == NULL || !busyCleanup(busyCtx)) {
+            // Strip unconfirmed (or impossible): flow contexts may still
+            // reference the callout, so every further retry must fail.
+            o->busyRetries = attempt + 1;
+            o->state = SkWfpStateLeaked;
+            return STATUS_DEVICE_BUSY;
+        }
         ShOps.SleepMs(delayMs);
     }
 }

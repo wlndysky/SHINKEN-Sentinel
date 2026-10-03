@@ -1,6 +1,6 @@
 // ============================================================================
 // runtime/runtime.h — unified runtime state machine / rundown / WFP object
-// tracking (see docs/UNLOAD_SAFETY.md).
+// tracking (proof inline in lifecycle/runtime headers).
 //
 // Architecture:
 //   * One runtime state machine for the whole merged driver (sensor + divert).
@@ -12,8 +12,8 @@
 //     "refuse unload" return; the only safe failure policy is not returning).
 //
 // Builds: kernel build (ShOps default table binds WDK APIs directly);
-// host-test build (SHINKEN_HOST_TEST): tests/ provide ShOps mocks + fault
-// injection.
+// host-test build (SHINKEN_HOST_TEST): ShOps mocks + fault injection are
+// provided externally.
 // ============================================================================
 #pragma once
 #include <ntddk.h>
@@ -90,7 +90,7 @@ typedef struct _SHINKEN_WFP_OBJECT {
 
 
 // ---------------------------------------------------------------------------
-// Injectable ops table (kernel defaults in runtime.c; tests/ override them)
+// Injectable ops table (kernel defaults in runtime.c; host-test build overrides them)
 // ---------------------------------------------------------------------------
 typedef struct _SHINKEN_OPS {
     // --- WFP unregister/delete (all return values must be checked) ---
@@ -211,7 +211,7 @@ NTSTATUS ShWfpEngineClose(SHINKEN_WFP_OBJECT *o, HANDLE engine);
 //           submit-failure path).
 //   Gate semantics close the UAF window "drain sees zero -> destroy handle
 //   -> classify Begins again and injects on the destroyed handle"
-//   (docs/UNLOAD_SAFETY.md §2).
+//   (unload safety invariant).
 BOOLEAN ShInjectionBegin(void); // FALSE = GateStop in effect, injection forbidden
 VOID ShInjectionEnd(void);
 LONG ShInjectionInFlight(void);

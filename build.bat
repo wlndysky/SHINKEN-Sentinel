@@ -1,18 +1,33 @@
 @echo off
-REM build.bat - shinken_wfp_demo modern driver build. Static and IR verification.
-REM Two stages. NOT a real WDK build (no WDK/MSBuild on this machine); see
-REM docs/ARCHITECTURE.md "verification boundary":
+REM build.bat - shinken_wfp_demo static syntax and IR verification.
+REM Two stages. NOT a real WDK build (no WDK/MSBuild on this machine); the
+REM only IR verification performed here is that opt -O2 succeeds. Real WDK
+REM compilation and kernel tests are required for a loadable driver.
 REM   A) per-module clang syntax check (shim/wdk_shim.h, gnu89)
 REM   B) LLVM IR: per-module -emit-llvm (-fdebug-compilation-dir=. strips local
 REM      paths), llvm-link merge, opt -O2 -> out/shinken_driver_O2.ll (+_opt.ll)
-REM IR results feed tools/check_ir.py (dead code/undefined symbols/optnone/
-REM DriverEntry count). They do NOT replace a real WDK build or kernel tests.
 setlocal
 cd /d "%~dp0"
-if "%LLVM_DIR%"=="" set LLVM_DIR=%ProgramFiles%\LLVM
+if "%LLVM_DIR%"=="" (
+    echo ERROR: LLVM_DIR environment variable is not set.
+    echo        Set LLVM_DIR to the LLVM installation root, e.g. C:\Program Files\LLVM
+    exit /b 1
+)
 set CLANG=%LLVM_DIR%\bin\clang.exe
 set OPT=%LLVM_DIR%\bin\opt.exe
 set LLVMLINK=%LLVM_DIR%\bin\llvm-link.exe
+if not exist "%CLANG%" (
+    echo ERROR: clang.exe not found at "%CLANG%"
+    exit /b 1
+)
+if not exist "%OPT%" (
+    echo ERROR: opt.exe not found at "%OPT%"
+    exit /b 1
+)
+if not exist "%LLVMLINK%" (
+    echo ERROR: llvm-link.exe not found at "%LLVMLINK%"
+    exit /b 1
+)
 set FLAGS=-target x86_64-pc-windows-msvc -std=gnu89 -DSHINKEN_HOST_SHIM -fdebug-compilation-dir=. -Wno-unknown-attributes -Wno-deprecated-non-prototype -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -I . -I shim -include shim\wdk_shim.h -include shim\wfp_layers.h
 set MODULES=runtime\rundown.c runtime\runtime.c runtime\lifecycle.c telemetry\event_queue.c rules\rule_match.c rules\rule_store.c rules\rule_engine.c control\ioctl.c wfp\wfp_guids.c wfp\wfp_objects.c wfp\wfp_callouts.c wfp\wfp_manager.c packet\classify.c packet\injection.c packet\flow_context.c packet\packet_helpers.c driver\device.c driver\driver.c
 

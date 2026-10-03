@@ -1,5 +1,5 @@
 // ============================================================================
-// runtime/lifecycle.h — 子系统生命周期编排(严格顺序, 见 docs/UNLOAD_SAFETY.md §7)
+// runtime/lifecycle.h — 子系统生命周期编排(严格顺序)
 //
 // quiesce 顺序(失败即 FALSE, 由 runtime 驻留):
 //   1. 关闭 IOCTL 新请求门(control/ioctl.c)

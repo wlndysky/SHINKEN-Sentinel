@@ -128,7 +128,7 @@ typedef enum _SK_VERDICT_REASON {
     // pid/appId/SID simply do not match (fail-closed, never silently matched).
 } SK_VERDICT_REASON;
 
-// ---- Verdict precedence (documented in docs/RULE_ENGINE.md; test-pinned) ----
+// ---- Verdict precedence (test-pinned) ----
 //   1) higher priority wins;
 //   2) tie: action strength BLOCK > RATE_LIMIT > AUDIT > ALLOW;
 //   3) tie: lower ruleId wins (deterministic);

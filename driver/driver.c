@@ -16,7 +16,7 @@
 //   SkEvtDriverUnload(sole KMDF unload callback)
 //     └─ ShRuntimeRunUnload(...) — destroy runs only after full quiesce;
 //        otherwise UNLOAD_BLOCKED + resident, no return (KMDF EvtDriverUnload
-//        has no "refuse unload" result; see docs/UNLOAD_SAFETY.md)
+//        has no "refuse unload" result).
 // ============================================================================
 #include <ntddk.h>
 #include <wdf.h>

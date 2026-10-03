@@ -21,8 +21,14 @@ extern "C" {
 #endif
 
 // injection subsystem lifecycle
+// SkInjectInit: state bit g_SkInjectInited==1 <=> handles+pools exist (strict
+// pairing on every failure path); idempotent while initialized; refused
+// (STATUS_INVALID_DEVICE_STATE) after a successful quiesce — the injection
+// gate's stop bit is irreversible, so re-init would create unusable handles.
 NTSTATUS SkInjectInit(void);        // create injection handles + NBL/NB pools
-BOOLEAN SkInjectQuiesce(void);      // GateStop + drain in-flight + destroy handles
+BOOLEAN SkInjectQuiesce(void);      // GateStop + drain in-flight + destroy handles;
+                                    // on full success clears the init state bit
+                                    // (re-init is then refused)
 VOID SkInjectDestroy(void);         // destroy pools (after handle destroy)
 
 // self-injection check (SK_INJECT_TAG written into the injection context at submit; compared in classify)

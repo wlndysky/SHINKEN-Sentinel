@@ -26,9 +26,18 @@ typedef struct _SHINKEN_EVENT_QUEUE {
     volatile LONG capacity;     // queue cap (0 = unbounded); when full: drop-newest
     volatile LONG64 overflowDropped; // stats: dropped because full (telemetry must never block classify)
     SHINKEN_EVENT doorbell;
-    PVOID threadObject;         // read/written inside the startLock critical section (see .c start protocol)
-    volatile LONG stopping;     // stop flag: set atomically (inside startLock),
-                                // always read atomically — never plain volatile
+    SHINKEN_EVENT stopDone;     // signaled once by the stop executor AFTER the
+                                // final state (2) + stopResult are published;
+                                // concurrent Stop callers wait on it
+    PVOID threadObject;         // read/written inside the startLock critical section (see .c start protocol);
+                                // cleared ONLY after a join returned exact STATUS_SUCCESS
+    volatile LONG stopping;     // stop state machine (all access via sk_atomic.h):
+                                //   0 = running (posts accepted)
+                                //   1 = stop in progress — exactly ONE thread
+                                //       (the CAS 0->1 winner) executes the stop flow
+                                //   2 = stopped (terminal): stopResult is final
+    NTSTATUS stopResult;        // written by the stop executor before publishing
+                                // state 2; every Stop caller receives exactly this
     volatile LONG producers;    // producers inside the "enqueue critical section"
                                 // (atomic); while held, the stopping recheck and
                                 // enqueue happen under the queue lock; Stop must
@@ -45,6 +54,10 @@ VOID ShEventQueueInit(SHINKEN_EVENT_QUEUE *q, EX_SPIN_LOCK *lock, LIST_ENTRY *he
 BOOLEAN ShEventPost(SHINKEN_EVENT_QUEUE *q, UINT32 type, UINT64 ctx, volatile LONG *counter);
 VOID ShEventThreadBody(PVOID ctx);
 NTSTATUS ShEventThreadStart(SHINKEN_EVENT_QUEUE *q);
+// Stop: CAS(0->1) elects exactly ONE executor; concurrent Stop callers wait
+// for it on stopDone and receive the SAME NTSTATUS. threadObject is cleared
+// only after a join returned exact STATUS_SUCCESS; on any failure (producers
+// stuck / join failed / queue non-empty) threadObject and ownership are kept.
 NTSTATUS ShEventThreadStop(SHINKEN_EVENT_QUEUE *q);
 VOID ShEventDrain(SHINKEN_EVENT_QUEUE *q);
 LONG ShEventPending(SHINKEN_EVENT_QUEUE *q);
@@ -60,9 +73,12 @@ BOOLEAN ShEventPostRecord(SHINKEN_EVENT_QUEUE *q, UINT32 type, const void *recor
 // ---------------------------------------------------------------------------
 extern SHINKEN_EVENT_QUEUE g_SkTelemetryQueue;
 
-VOID SkTelemetryInit(void);      // initialize the queue (idempotent)
-NTSTATUS SkTelemetryStart(void); // start the consumer thread
-VOID SkTelemetryStop(void);      // stop protocol (gate + join + drain)
+VOID SkTelemetryInit(void);        // initialize the queue (idempotent)
+NTSTATUS SkTelemetryStart(void);   // start the consumer thread
+NTSTATUS SkTelemetryStop(void);    // stop protocol (gate + join + drain); returns the
+                                   // exact ShEventThreadStop result — callers must not
+                                   // discard it (a failure means the thread/queue may
+                                   // still be live and destroy is forbidden)
 BOOLEAN SkTelemetryPost(UINT32 type, UINT64 ctx, volatile LONG *counter);
 BOOLEAN SkTelemetryPostRecord(UINT32 type, const void *record, UINT32 size);
 // Stats and flush (FLUSH_EVENTS): flush copies the consumed-record ring to out (kernel buffer)

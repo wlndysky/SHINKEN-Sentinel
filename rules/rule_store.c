@@ -94,7 +94,7 @@ static BOOLEAN g_StoreClosed;                // cannot revive after Shutdown
 // Host-test barrier hook (test builds only; unreferenced in kernel builds):
 // called inside reader section R after g_Current was read but before
 // ShRundownAcquire, to force the most dangerous "reader vs publish/close"
-// interleaving (see tests/test_snapshot.c; same pattern as telemetry's
+// interleaving (same pattern as telemetry's
 // ShEventTestBarrier).
 VOID (*ShRuleStoreTestBarrier)(const SK_RULE_SNAPSHOT *snap);
 #endif
@@ -623,10 +623,18 @@ NTSTATUS SkRuleStoreUpdate(const SK_RULE *rule) {
     arr[i] = *rule;
     SkSortRules(arr, n);
     st = SkPublish(arr, n, cur->defaultPolicy);
-    // Update keeps the token bucket: the bucket belongs to the ruleId
-    // lifetime, not to a snapshot generation — a content update of the same
-    // rule does not clear rate state (only delete/disable/replaced-away does,
-    // via the SkPublish diff or the caller).
+    // Update keeps the token bucket for the same ruleId, but:
+    //   - rateTokens/rateIntervalMs changes reset the bucket immediately;
+    //   - burst shrink clamps the live token count immediately.
+    if (NT_SUCCESS(st) && rule->action == SkRuleActionRateLimit) {
+        const SK_RULE *oldRule = &cur->rules[i];
+        if (oldRule->rateTokens != rule->rateTokens ||
+            oldRule->rateIntervalMs != rule->rateIntervalMs) {
+            SkRuleRateReset(rule->ruleId);
+        } else if (rule->burst < oldRule->burst) {
+            SkRuleRateClampBurst(rule->ruleId, rule->burst);
+        }
+    }
     SkStoreUnlock();
     return st;
 }

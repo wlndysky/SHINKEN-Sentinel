@@ -7,10 +7,36 @@
 //     file never dereferences user pointers; protocol structs hold no pointers.
 //   * Request gate: g_ControlGateOpen (this module, closed by Quiesce) &&
 //     ShRuntimeIsActive(); new IOCTLs during unload fail DEVICE_NOT_READY.
+//   * Handle-create gate: EvtFileCreate Acquires g_HandleCreateRundown
+//     (runtime ShRundown); SkControlQuiesce BeginStops then Drains the SAME
+//     object, so "create allowed + counted" and "no more creates" are
+//     serialized on one primitive — a bare volatile gate read would still be
+//     a TOCTOU here (proof: runtime/rundown.h invariants 1-2). A create
+//     returns success only after Acquire + counted=TRUE + ShHandleOpen have
+//     ALL completed; the Acquire is Released when the create returns (Quiesce
+//     Drains exactly those in-flight creates), while the handle count itself
+//     stays paired until EvtFileDestroy. On Acquire failure the create fails
+//     with counted=FALSE, so Destroy never pairs a close for a count that was
+//     never taken.
 //   * Handle count: ShHandleOpen in EvtFileCreate, paired ShHandleClose in
-//     EvtFileDestroy by `counted`; SkControlQuiesce bounded-waits for zero.
-//   * Privilege: SkIoctlQueryCallerPrivileged() once at create, stored in the
-//     per-handle SK_IOCTL_CONTEXT; query commands open, modify needs privilege.
+//     EvtFileDestroy by `counted`. Quiesce order (defect fix, P1): close
+//     request gate -> close create gate (BeginStop) -> Drain in-flight
+//     FileCreates -> stop/join consumer + purge queue -> bounded-wait the
+//     handle count to zero -> only then may SkControlDestroy delete the device.
+//   * Privilege model: OPTION (a) handle-scoped capability (design note at
+//     SkIoctlQueryCallerPrivileged): privilege is decided ONCE at create, in
+//     the creating process's context, and cached in the per-handle context;
+//     modify commands check the cached flag, query commands are open.
+//     Exposure: the capability is bound to the handle object, so a handle
+//     duplicated into another process (DuplicateHandle / inheritance) carries
+//     it until close; there is no per-request re-evaluation.
+//   * Query-surface note (NOT a security boundary): query commands
+//     (capabilities/rule version/enum/stats/event flush) use FILE_ANY_ACCESS
+//     and the SDDL grants Everyone (WD) generic read, so every local process
+//     can read rule metadata, statistics and recent event records. That is a
+//     deliberate diagnostic/telemetry surface; it must never be described as
+//     a complete confidentiality boundary, and no secret material may be
+//     placed in query payloads.
 //   * Validation order (locked, test-anchored): inlen >= sizeof(header) ->
 //     Size == actual inlen -> Version -> Flags==0 -> Command < SkCmdMax ->
 //     IOCTL function == Command -> privilege for modify -> per-command payload.
@@ -59,9 +85,30 @@ VOID SkDeviceDelete(void); // WdfObjectDelete(g_SkControlWdfDevice) + clear, ide
 
 // ---------------------------------------------------------------------------
 // Privilege decision (at create, in the caller's process context, PASSIVE)
+//
+// Chosen model: (a) create-time privilege cache = HANDLE-SCOPED CAPABILITY.
+// Why not (b) per-request authorization: a re-check on the dedicated consumer
+// thread would observe that thread's SYSTEM token, not the original
+// requester's; per-request capture+reference of the requester token is a
+// larger protocol with token-lifetime hazards. Model (a) decides once, in the
+// creating thread's process context, during IRP_MJ_CREATE dispatch (PASSIVE).
+//
+// Exposure surface (kept explicit on purpose): the cached flag is a property
+// of the FILE OBJECT, so any handle duplicated into another process
+// (DuplicateHandle, handle inheritance) carries the same capability until
+// close, and token membership changes (e.g. admin rights revoked) take effect
+// only at the next handle open. This cache is defense in depth on top of the
+// device SDDL (driver/device.c: SY/BA GA, WD GR) — never the sole boundary.
+//
+// Query-surface (defect-fix note): GET capabilities/rule version/enum/stats
+// and event flush are FILE_ANY_ACCESS and readable by Everyone per the SDDL.
+// That exposes rule metadata, counters and recent event payloads to any local
+// process by design (diagnostic/telemetry); it is NOT a security boundary and
+// the code must not pretend otherwise.
 // ---------------------------------------------------------------------------
 #ifdef SHINKEN_HOST_TEST
-// host tests: defined by tests/ (single-TU include; no default here)
+// host-test builds: provided by the single-TU host harness (the repo is a
+// source-only release; the harness lives outside it); no default here
 BOOLEAN SkIoctlQueryCallerPrivileged(void);
 #else
 // Defense in depth on top of the device SDDL (GA only for SY/BA): privileged
@@ -89,6 +136,19 @@ BOOLEAN SkIoctlQueryCallerPrivileged(void) {
 // ---------------------------------------------------------------------------
 static volatile LONG g_ControlGateOpen = 0; // 1=accept IOCTL (runtime Active also required)
 static BOOLEAN g_ControlReady = FALSE;      // control device created
+
+// Handle-create gate (P1 defect fix: FileCreate <-> quiesce linearization).
+// EvtFileCreate Acquires this rundown for the duration of the create and
+// Releases it when the create returns; SkControlQuiesce BeginStops then Drains
+// the SAME object before waiting the handle count to zero. ShRundown's
+// BeginStop atomic-OR is the single linearization point (runtime/rundown.h
+// invariant 2): a create either passes its Acquire CAS before the OR (it
+// completes, its handle is counted) or fails after it, and Drain returns only
+// once every in-flight create has Released. The stop bit is irreversible,
+// matching the one-way device teardown. A plain volatile "create allowed"
+// flag would leave the "check flag -> count++" window unsynchronized against
+// Quiesce — this is the required shared primitive.
+static SHINKEN_RUNDOWN g_HandleCreateRundown;
 
 #define SK_CONTROL_DRAIN_RETRIES 200 /* 200 * 10ms = 2s bounded handle-drain wait */
 #define SK_CONTROL_DRAIN_MS 10
@@ -632,11 +692,33 @@ VOID SkIoctlEvtFileCreate(WDFDEVICE device, WDFREQUEST request, WDFFILEOBJECT fi
 #else
     ctx = SkIoctlGetContext(fileObject);
 #endif
-    if (ctx) {
-        ctx->privileged = SkIoctlQueryCallerPrivileged(); // decided once at create
-        ctx->counted = TRUE;
-        ShHandleOpen(); // unload-gate drain object; Destroy pairs by `counted`
+    // The per-handle context must exist (device.c attaches it at device
+    // creation): without it the create cannot be counted, and an uncounted
+    // successful create would reopen exactly the TOCTOU the create gate
+    // closes below.
+    if (!ctx) {
+        WdfRequestComplete(request, STATUS_INVALID_DEVICE_REQUEST);
+        return;
     }
+    // Create gate (same ShRundown protocol as SkControlQuiesce). Acquire
+    // failure = Quiesce BeginStop already in effect: fail the create WITHOUT
+    // marking it counted — no ShHandleOpen ran, so EvtFileDestroy has nothing
+    // to pair, and no half-created context can hold the unload drain open.
+    if (!ShRundownAcquire(&g_HandleCreateRundown)) {
+        WdfRequestComplete(request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+    // Success is returned only after the whole "allowed + counted" sequence
+    // completes: the Acquire above (creation allowed), counted=TRUE, then the
+    // count increment — strictly in this order, all before the completing
+    // call below. EvtFileDestroy pairs exactly one ShHandleClose per
+    // counted=TRUE context. The rundown release marks "this create is no
+    // longer in flight" — Quiesce's Drain waits exactly for this — while the
+    // handle itself stays counted until its Destroy.
+    ctx->privileged = SkIoctlQueryCallerPrivileged(); // model (a): decided once at create
+    ctx->counted = TRUE;                              // only AFTER the gate accepted the create
+    ShHandleOpen();
+    ShRundownRelease(&g_HandleCreateRundown);
     WdfRequestComplete(request, STATUS_SUCCESS);
 }
 
@@ -739,6 +821,10 @@ NTSTATUS SkControlInit(PDRIVER_OBJECT driverObject) {
         g_ControlReady = FALSE;
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    // Handle-create gate: fresh (re)init before the gate opens. The rundown
+    // lives in image-level static storage and is never freed (rundown.h
+    // invariant 9); stop is one-way, which matches the one-way teardown.
+    ShRundownInit(&g_HandleCreateRundown, "ControlHandleCreate");
     // Open the request gate only after the consumer exists (fenced create:
     // success means the startup decision is made; failure left no consumer).
     SkAtFence();
@@ -749,9 +835,24 @@ NTSTATUS SkControlInit(PDRIVER_OBJECT driverObject) {
 BOOLEAN SkControlQuiesce(void) {
     ULONG i;
     NTSTATUS jst;
+    // Order contract (P1 defect fix): close the request gate AND the
+    // handle-create gate FIRST, then wait for FileCreates already inside the
+    // gate, then drain everything else, then wait handles==0. Device destroy
+    // (SkControlDestroy) is legal only after this returns TRUE.
     g_ControlGateOpen = 0; // close request gate: new IOCTLs -> DEVICE_NOT_READY
     SkAtFence();
-    // Stop the consumer first: stop flag, then signal its event (the set/wait
+    // Close the create gate: after BeginStop's linearization point no new
+    // FileCreate can pass its Acquire (rundown.h invariant 2).
+    ShRundownBeginStop(&g_HandleCreateRundown);
+    // Wait for FileCreates already inside the gate to finish (each either
+    // completed "counted=TRUE + ShHandleOpen" before its Acquire, or failed).
+    // Only then is the handle count guaranteed to be monotone-decreasing.
+    if (ShRundownDrain(&g_HandleCreateRundown, SK_CONTROL_DRAIN_RETRIES,
+                       SK_CONTROL_DRAIN_MS) != STATUS_SUCCESS) {
+        ShRuntimeRecordBlock(ShinkenBlockHandleContextsOpen); // create in flight won't finish
+        return FALSE;
+    }
+    // Stop the consumer: stop flag, then signal its event (the set/wait
     // pair orders the flag; the thread always wakes, even mid-drain).
     SkAtOr32(&g_SkDequeueStop, 1);
     ShOps.EventSet(&g_SkDequeueStopEvent);
@@ -769,7 +870,9 @@ BOOLEAN SkControlQuiesce(void) {
     // let WDF complete them (unload semantics: user side sees failure).
     if (g_SkControlWdfQueue != NULL)
         WdfIoQueuePurge(g_SkControlWdfQueue, NULL, NULL);
-    // Bounded wait for per-handle count to reach zero (Destroy pairs decrement)
+    // Bounded wait for per-handle count to reach zero (EvtFileDestroy pairs
+    // the decrement). The create gate is closed, so the count cannot grow —
+    // every counted handle will reach its Destroy, barring a wedged user process.
     for (i = 0; i < SK_CONTROL_DRAIN_RETRIES; i++) {
         if (ShHandlesOpen() == 0)
             return TRUE;

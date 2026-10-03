@@ -16,23 +16,29 @@
 //     fwpstypes.h, authoritative comment in fwpstypes.idl): a callout
 //     may write actionType only while it holds FWPS_RIGHT_ACTION_WRITE
 //     ("FWPS_RIGHT_ACTION_WRITE must be held to update the actionType
-//     unless executing a veto"; this driver never vetoes), and must
-//     NEVER grant itself that right (no rights |=
-//     FWPS_RIGHT_ACTION_WRITE anywhere). With the bit clear on entry a
-//     higher-priority component already decided: actionType/rights
-//     stay untouched (fail-open, no re-arbitration from here) — but
-//     rule evaluation and audit telemetry still run, because AUDIT's
-//     contract is "record, never change the action": audit visibility
-//     must not depend on arbitration state (SkClassifyApplyVerdict
-//     gates ONLY the classifyOut write on the right). When this
-//     callout owns the verdict it writes actionType and CLEARS the
-//     WRITE bit — final within WFP arbitration (kernel execution of
-//     the written action is the platform's responsibility; a hardened
-//     VM may ignore third-party callout verdicts, see
-//     docs/REAL_KERNEL_VALIDATION_20260913.md). BLOCK only on
-//     ALE_AUTH_* (hardBlockAllowed=1); layers with
-//     hardBlockAllowed==0 (FLOW_ESTABLISHED_*) only PERMIT even when
-//     the computed verdict is BLOCK (never forced BLOCK).
+//     unless executing a veto"); this driver never vetoes and NEVER
+//     grants itself that right (no rights |= FWPS_RIGHT_ACTION_WRITE
+//     anywhere). With the bit clear on entry a higher-priority component
+//     already decided: actionType/rights stay untouched (fail-open, no
+//     re-arbitration from here) — but rule evaluation and audit
+//     telemetry still run, because AUDIT's contract is "record, never
+//     change the action": audit visibility must not depend on
+//     arbitration state (SkClassifyApplyVerdict gates ONLY the
+//     classifyOut write on the right). Finality: a written BLOCK always
+//     clears the WRITE right (a veto consumes it). A written PERMIT
+//     clears the WRITE right ONLY when the matched filter carries
+//     FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT — the driver's own filters are
+//     added with FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT (wfp_objects.c), so
+//     its permit is final; for a foreign filter without the flag the
+//     right survives and lower-priority sublayers keep arbitrating. The
+//     BLOCK verdict computed here is an internal decision of this
+//     callout — whether the kernel actually drops the connection is the
+//     platform's arbitration outcome (a hardened VM may ignore
+//     third-party callout verdicts entirely), so no comment here may
+//     describe the verdict as a guaranteed Windows-enforced BLOCK.
+//     BLOCK is only computed on ALE_AUTH_* (hardBlockAllowed=1); layers
+//     with hardBlockAllowed==0 (FLOW_ESTABLISHED_*) only PERMIT even
+//     when the computed verdict is BLOCK (never forced BLOCK).
 //   * FLOW_ESTABLISHED_*: always PERMIT, no rule evaluation; only
 //     attach/reuse the flow context (release is flowDelete/RemoveAll's
 //     job; attach failure does not affect the permit).
@@ -78,6 +84,29 @@
 // telemetry event types (match SK_EVENT_RECORD.type in control/protocol.h)
 #define SK_EVT_VERDICT_AUDIT 1
 #define SK_EVT_RATE_LIMITED  3
+
+// FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT (fwpsk.h): the matched filter
+// permits the callout to consume the action-write right with a PERMIT
+// (declared by FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT at filter-add time).
+#ifndef FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT
+#define FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT 0x00000001u
+#endif
+
+// Filter flag read, single definition point. Production reads the real
+// FWPS_FILTER1 field; the host shim keeps FWPS_FILTER1 opaque
+// (shim/wdk_shim.h), so the shim build routes the flag through a
+// host-provided hook (the interleaving-test harness supplies it).
+#ifdef SHINKEN_HOST_SHIM
+UINT32 SkTestFilterFlags(const FWPS_FILTER1 *filter); // host TU provides
+static BOOLEAN skFilterClearsActionRight(const FWPS_FILTER1 *filter) {
+    return (SkTestFilterFlags(filter) & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT) != 0;
+}
+#else
+static BOOLEAN skFilterClearsActionRight(const FWPS_FILTER1 *filter) {
+    return filter != NULL &&
+           (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT) != 0;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Self-injection guard: packets injected by this driver (context low
@@ -219,12 +248,14 @@ static VOID skClassifyPostEvent(UINT32 type, UINT64 ruleId,
 
 // tuple => verdict => classifyOut (verdict-rights contract in the file
 // header; audit-split contract: evaluate + telemetry ALWAYS, gate only
-// the actionType/rights write on FWPS_RIGHT_ACTION_WRITE)
+// the actionType/rights write on FWPS_RIGHT_ACTION_WRITE). filter carries
+// FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT for the PERMIT-finality decision.
 VOID SkClassifyApplyVerdict(UINT32 layerId, const SK_CLASSIFY_TUPLE *tuple,
-                            FWPS_CLASSIFY_OUT0 *classifyOut) {
+                            const FWPS_FILTER1 *filter, FWPS_CLASSIFY_OUT0 *classifyOut) {
     const SK_RULE_SNAPSHOT *snap;
     SK_VERDICT verdict;
     const SK_CALLOUT_DEF *def;
+    BOOLEAN permitFinal;
 
     // A tuple is required by both matching and telemetry; reject malformed
     // direct callers before either path can dereference it.
@@ -261,24 +292,31 @@ VOID SkClassifyApplyVerdict(UINT32 layerId, const SK_CLASSIFY_TUPLE *tuple,
         (classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0)
         return;
 
+    // PERMIT finality: only a filter that declared
+    // FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT lets this callout consume the
+    // write right with a PERMIT; otherwise the right survives for
+    // lower-priority sublayers (this driver's own filters declare it at
+    // add time — see SkWfpObjectAddFilter).
+    permitFinal = skFilterClearsActionRight(filter);
+
     def = SkCalloutDefById(layerId);
     if (verdict.action == SkVerdictBlock && def && def->hardBlockAllowed) {
         // Hard verdict only on ALE_AUTH_* layers. Clearing the WRITE
-        // right (never setting it) makes this callout's action final
+        // right (never setting it) makes this callout's BLOCK final
         // within WFP arbitration: lower-weight sublayers can no longer
-        // overwrite it. (Computed verdict != kernel execution; see the
-        // file header.)
+        // overwrite it. (Computed verdict != guaranteed kernel
+        // enforcement; see the file header.)
         classifyOut->actionType = FWP_ACTION_BLOCK;
         classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
         return;
     }
-    // PERMIT (default policy / ALLOW / AUDIT / fail-open on layers
-    // that disallow hard BLOCK): once written, this callout's action
-    // is final as well, so the WRITE right is cleared here too — the
-    // fwpstypes.h contract (FWPS_CLASSIFY_OUT0 / FWPS_RIGHT_ACTION_WRITE)
-    // never requires PERMIT to keep the bit.
+    // PERMIT (default policy / ALLOW / AUDIT / fail-open, and BLOCK
+    // verdicts computed on layers that disallow hard BLOCK): the action
+    // is written under the held right; the right itself is consumed
+    // only when the filter declared CLEAR_ACTION_RIGHT.
     classifyOut->actionType = FWP_ACTION_PERMIT;
-    classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+    if (permitFinal)
+        classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +327,7 @@ VOID SkClassifyApplyVerdict(UINT32 layerId, const SK_CLASSIFY_TUPLE *tuple,
 static VOID skClassifyAleCommon(UINT32 layerId,
                                 const FWPS_INCOMING_VALUES0 *inFixed,
                                 const FWPS_INCOMING_METADATA_VALUES0 *meta,
-                                UINT64 flowContext,
+                                UINT64 flowContext, const FWPS_FILTER1 *filter,
                                 FWPS_CLASSIFY_OUT0 *classifyOut) {
     SK_CLASSIFY_TUPLE tuple;
 
@@ -297,35 +335,41 @@ static VOID skClassifyAleCommon(UINT32 layerId,
         return;
     if (skClassifySelfInjected(flowContext)) {
         // self-injected packet: permit directly (verdict-rights contract:
-        // write only while holding the WRITE right; action final)
+        // write only while holding the WRITE right; the right is consumed
+        // only when the matched filter declared CLEAR_ACTION_RIGHT)
         if (classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) {
             classifyOut->actionType = FWP_ACTION_PERMIT;
-            classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+            if (skFilterClearsActionRight(filter))
+                classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
         }
         return;
     }
     SkClassifyBuildTuple(layerId, inFixed, meta, &tuple);
-    SkClassifyApplyVerdict(layerId, &tuple, classifyOut);
+    SkClassifyApplyVerdict(layerId, &tuple, filter, classifyOut);
 }
 
 // FLOW_ESTABLISHED common body: always PERMIT + attach the flow
 // context (flowDelete/RemoveAll own release; attach failure does not
-// affect the permit).
+// affect the permit). Same verdict-rights protocol as the ALE path:
+// PERMIT consumes the WRITE right only when the matched filter declared
+// CLEAR_ACTION_RIGHT.
 static VOID skClassifyFlowCommon(UINT32 layerId,
                                  const FWPS_INCOMING_METADATA_VALUES0 *meta,
-                                 UINT64 flowContext,
+                                 UINT64 flowContext, const FWPS_FILTER1 *filter,
                                  FWPS_CLASSIFY_OUT0 *classifyOut) {
     UINT32 runtimeId;
 
     if (classifyOut == NULL)
         return;
     // FLOW_ESTABLISHED: always PERMIT, never BLOCK — written only under
-    // the verdict-rights contract (final once written). Without the
-    // WRITE right a higher-priority component already decided; the
-    // flow-context attach below is bookkeeping and still runs.
+    // the verdict-rights contract (the WRITE right is consumed only on a
+    // filter that declared CLEAR_ACTION_RIGHT). Without the WRITE right a
+    // higher-priority component already decided; the flow-context attach
+    // below is bookkeeping and still runs.
     if (classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) {
         classifyOut->actionType = FWP_ACTION_PERMIT;
-        classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+        if (skFilterClearsActionRight(filter))
+            classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
     }
     if (skClassifySelfInjected(flowContext))
         return;
@@ -356,8 +400,7 @@ VOID NTAPI SkClassifyAleAuthConnectV4(const FWPS_INCOMING_VALUES0 *inFixed,
                                       FWPS_CLASSIFY_OUT0 *classifyOut) {
     UNREFERENCED_PARAMETER(layerData);
     UNREFERENCED_PARAMETER(classifyContext);
-    UNREFERENCED_PARAMETER(filter);
-    skClassifyAleCommon(SkLayerAleAuthConnectV4, inFixed, meta, flowContext,
+    skClassifyAleCommon(SkLayerAleAuthConnectV4, inFixed, meta, flowContext, filter,
                         classifyOut);
 }
 
@@ -368,7 +411,7 @@ VOID NTAPI SkClassifyAleAuthConnectV6(const FWPS_INCOMING_VALUES0 *a,
     UNREFERENCED_PARAMETER(c);
     UNREFERENCED_PARAMETER(d);
     UNREFERENCED_PARAMETER(e);
-    skClassifyAleCommon(SkLayerAleAuthConnectV6, a, b, f, g);
+    skClassifyAleCommon(SkLayerAleAuthConnectV6, a, b, f, e, g);
 }
 
 VOID NTAPI SkClassifyAleRecvAcceptV4(const FWPS_INCOMING_VALUES0 *a,
@@ -378,7 +421,7 @@ VOID NTAPI SkClassifyAleRecvAcceptV4(const FWPS_INCOMING_VALUES0 *a,
     UNREFERENCED_PARAMETER(c);
     UNREFERENCED_PARAMETER(d);
     UNREFERENCED_PARAMETER(e);
-    skClassifyAleCommon(SkLayerAleRecvAcceptV4, a, b, f, g);
+    skClassifyAleCommon(SkLayerAleRecvAcceptV4, a, b, f, e, g);
 }
 
 VOID NTAPI SkClassifyAleRecvAcceptV6(const FWPS_INCOMING_VALUES0 *a,
@@ -388,7 +431,7 @@ VOID NTAPI SkClassifyAleRecvAcceptV6(const FWPS_INCOMING_VALUES0 *a,
     UNREFERENCED_PARAMETER(c);
     UNREFERENCED_PARAMETER(d);
     UNREFERENCED_PARAMETER(e);
-    skClassifyAleCommon(SkLayerAleRecvAcceptV6, a, b, f, g);
+    skClassifyAleCommon(SkLayerAleRecvAcceptV6, a, b, f, e, g);
 }
 
 VOID NTAPI SkClassifyFlowEstablishedV4(const FWPS_INCOMING_VALUES0 *a,
@@ -399,7 +442,7 @@ VOID NTAPI SkClassifyFlowEstablishedV4(const FWPS_INCOMING_VALUES0 *a,
     UNREFERENCED_PARAMETER(c);
     UNREFERENCED_PARAMETER(d);
     UNREFERENCED_PARAMETER(e);
-    skClassifyFlowCommon(SkLayerFlowEstablishedV4, b, f, g);
+    skClassifyFlowCommon(SkLayerFlowEstablishedV4, b, f, e, g);
 }
 
 VOID NTAPI SkClassifyFlowEstablishedV6(const FWPS_INCOMING_VALUES0 *a,
@@ -410,5 +453,5 @@ VOID NTAPI SkClassifyFlowEstablishedV6(const FWPS_INCOMING_VALUES0 *a,
     UNREFERENCED_PARAMETER(c);
     UNREFERENCED_PARAMETER(d);
     UNREFERENCED_PARAMETER(e);
-    skClassifyFlowCommon(SkLayerFlowEstablishedV6, b, f, g);
+    skClassifyFlowCommon(SkLayerFlowEstablishedV6, b, f, e, g);
 }

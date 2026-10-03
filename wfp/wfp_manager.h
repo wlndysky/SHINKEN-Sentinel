@@ -1,16 +1,23 @@
 // ============================================================================
 // wfp/wfp_manager.h — WFP manager: unified install, transaction,
 // rollback and teardown of engine session / provider / sublayer /
-// callout / filter (see docs/WFP_LIFETIME.md)
+// callout / filter
 //
 // Install order: engine open (DYNAMIC session) -> provider -> sublayer ->
-// per layer: callout register -> callout add -> filter add (txn commit).
-// Rollback: delete only REGISTERED/ACTIVE objects in reverse phase
-// order; unknown error => Leaked => caller parks (no image-unloading
-// failure). Teardown: stop new classify references first (callout
-// unregister is the documented safe point), strip flow contexts between
-// BUSY retries, then delete filter/callout/sublayer/provider and close
-// the engine. Idempotent.
+// per layer: callout register (flow-attach gate re-armed) -> callout add
+// -> filter add (txn commit).
+// Rollback: delete everything still on the books in reverse phase order —
+// per layer filter -> callout (attach gate stop+drain, flow strip+settle,
+// runtime unregister + mgmt delete; a failed FwpmCalloutAdd0 does NOT
+// erase the runtime registration) -> sublayer -> provider -> close
+// engine. Abort's return value is checked. Unknown error => Leaked =>
+// caller parks (no image-unloading failure).
+// Teardown: per callout close + drain the flow-attach gate, then strip
+// and settle flow contexts BEFORE the callout-unregister safe point
+// (busyCleanup still strips between BUSY retries), then delete
+// filter/callout/sublayer/provider and close the engine. Idempotent.
+// FALSE on failure (LEAKED / BUSY exhausted / flows not settled):
+// caller parks.
 // ============================================================================
 #pragma once
 #include <ntddk.h>

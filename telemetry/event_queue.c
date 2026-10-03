@@ -1,35 +1,43 @@
 // ============================================================================
 // telemetry/event_queue.c — telemetry event queue thread (the real consumer).
 // This file is the sole owner of the queue: the produce/consume/stop/drain
-// protocol is described below and in docs/UNLOAD_SAFETY.md §5.
+// protocol is described below.
 //
 // Node layout (kernel-owned memory, fully copied before enqueue, no user
 // pointers retained):
 //   +0x00 UINT32 type            event type
+//   +0x04 UINT32 payloadSize     payload valid bytes (0 = no inline record)
 //   +0x08 UINT64 ctx             referenced object (producer already +1 ref)
 //   +0x10 volatile LONG* counter optional counter (producer already +1)
-//   +0x18 LIST_ENTRY link        list node
+//   +0x18 LIST_ENTRY link        list node (popped via CONTAINING_RECORD)
 //
-// Lock order: the queue lock protects only the list and the stopping/
-// producers gate; onEvent/freeNode are always called outside the queue lock
-// (onEvent takes flow-table locks / refcount ops and must not nest under it).
+// Lock order: the queue lock protects only the list and the producers gate;
+// onEvent/freeNode are always called outside the queue lock (onEvent takes
+// flow-table locks / refcount ops and must not nest under it).
 //
-// Stop protocol (producer gate latch + producer refcount + consumer join +
-// fallback drain):
+// Stop protocol (single-stopper state machine + producer gate + join):
 //   Post:  producer-gate Enter (under queue lock: check stopping, on success
 //          producers+1) -> allocate node -> recheck stopping under queue lock
 //          -> enqueue / abandon -> Leave
-//   Stop:  inside startLock set stopping=1 (closes the production entrance;
-//          forms a single linearization point with Enter's in-lock check) ->
-//          wait producers==0 (all entered producers have left; any later Post
-//          must take the drop path, no new node possible) -> wake -> join ->
-//          drain
-//   Any failure: caller records ShinkenBlockEventThreadDrain and stays
-//   resident.
-// Key invariant: "stopping set" and "Post's stopping check" both happen under
-// the same queue lock, so there is no TOCTOU of the form "post passes the
-// check, stop completes drain, post then enqueues" — a post either enqueues
-// before the set (covered by drain/join) or reads stopping after it and drops.
+//   Stop:  CAS stopping 0->1 elects exactly ONE stop executor; every other
+//          concurrent Stop caller waits on q->stopDone until state 2 is
+//          published and then returns the SAME recorded stopResult — losers
+//          never drain, free, join, or touch threadObject themselves. The
+//          executor: take threadObject under startLock (ownership stays with
+//          the queue until a join confirms exit) -> wait producers==0 (any
+//          producer that entered before the CAS is covered; any later Post
+//          observes stopping!=0 under the queue lock and drops) -> wake ->
+//          join; ONLY on exact STATUS_SUCCESS clear threadObject (under
+//          startLock) -> fallback drain -> publish stopResult, stopping=2,
+//          EventSet(stopDone).
+//   No-TOCTOU argument: "stopping!=0" and Post's in-lock stopping check are
+//   both atomic observations of the same word, and a producer holding a
+//   producers reference is awaited (producers==0) before join/drain — a post
+//   either enqueued before the CAS (covered by join/drain) or reads the new
+//   state and drops; it cannot enqueue after the drain.
+//   Any failure: threadObject and ownership info are RETAINED (the thread may
+//   still run), stopResult carries the failure, the caller records
+//   ShinkenBlockEventThreadDrain and stays resident.
 // Capacity policy: when capacity>0 and the queue is full (in-lock
 // pending>=capacity), drop-newest and count overflowDropped — telemetry must
 // never block the classify/verdict path. All send failures (stopped / full /
@@ -39,6 +47,13 @@
 #include <ntddk.h>
 #include "../runtime/sk_atomic.h"
 #include "event_queue.h"
+
+// CONTAINING_RECORD: real WDK provides it via wdm.h; the shim does not (same
+// fallback pattern as packet/flow_context.c).
+#ifndef CONTAINING_RECORD
+#define CONTAINING_RECORD(addr, type, field) \
+    ((type *)((char *)(addr) - (size_t)&((type *)0)->field))
+#endif
 
 static VOID shEventNodeConsume(SHINKEN_EVENT_QUEUE *q, SHINKEN_EVENT_NODE *n) {
     // Called outside the queue lock: counter decrement + ctx release + node accounting
@@ -73,7 +88,7 @@ static SHINKEN_EVENT_NODE *shEventPopLocked(SHINKEN_EVENT_QUEUE *q) {
     q->head->Flink = ent->Flink; // RemoveHeadList
     ent->Flink->Blink = q->head;
     SkAtSub32((volatile LONG *)q->pending, 1);
-    return (SHINKEN_EVENT_NODE *)((char *)ent - 0x18);
+    return CONTAINING_RECORD(ent, SHINKEN_EVENT_NODE, link);
 }
 
 // ---------------------------------------------------------------------------
@@ -83,12 +98,13 @@ static LONG shEventStoppingRead(SHINKEN_EVENT_QUEUE *q) {
     return SkAtOr32(&q->stopping, 0); // atomic read
 }
 
-// Producer gate: check stopping and register producers under the queue lock —
-// forms a single linearization point with Stop's in-lock stopping set; holding
-// a producers reference permits enqueue.
+// Producer gate: check stopping and register producers under the queue lock.
+// The gate closes at Stop's CAS(0->1) linearization point; Enter's in-lock
+// check plus the producers refcount jointly close the enqueue window (see the
+// file-header stop protocol).
 static BOOLEAN shEventProducerEnter(SHINKEN_EVENT_QUEUE *q) {
     KIRQL irql = ShOps.LockAcquireExclusive(q->lock);
-    if (q->stopping) {
+    if (shEventStoppingRead(q) != 0) {
         ShOps.LockReleaseExclusive(q->lock, irql);
         return FALSE;
     }
@@ -104,7 +120,8 @@ static VOID shEventProducerLeave(SHINKEN_EVENT_QUEUE *q) {
 #ifdef SHINKEN_HOST_TEST
 // Host-test barrier hook (test builds only): invoked after acquiring the
 // producer reference and before node allocation, to force the "passed the
-// stopping check then paused" TOCTOU interleaving (see T16).
+// stopping check then paused" TOCTOU interleaving. Used by the external
+// forced-interleaving host harness (repo-external: E:/test/verify/control-telemetry/).
 VOID (*ShEventTestBarrier)(SHINKEN_EVENT_QUEUE *q);
 #endif
 
@@ -116,6 +133,7 @@ VOID ShEventQueueInit(SHINKEN_EVENT_QUEUE *q, EX_SPIN_LOCK *lock, LIST_ENTRY *he
     q->onEvent = onEvent;
     q->threadObject = NULL;
     q->stopping = 0;
+    q->stopResult = STATUS_SUCCESS;
     q->producers = 0;
     q->startLock = 0;
     q->posted = q->consumed = q->dropped = 0;
@@ -125,6 +143,7 @@ VOID ShEventQueueInit(SHINKEN_EVENT_QUEUE *q, EX_SPIN_LOCK *lock, LIST_ENTRY *he
     q->capacity = 0;
     q->overflowDropped = 0;
     ShOps.EventInit(&q->doorbell);
+    ShOps.EventInit(&q->stopDone); // signaled once when the stop executor publishes state 2
 }
 
 BOOLEAN ShEventPost(SHINKEN_EVENT_QUEUE *q, UINT32 type, UINT64 ctx, volatile LONG *counter) {
@@ -136,14 +155,15 @@ BOOLEAN ShEventPost(SHINKEN_EVENT_QUEUE *q, UINT32 type, UINT64 ctx, volatile LO
             SkAtSub32(counter, 1);
         return FALSE;
     }
-    // 1) Producer gate: in-lock stopping check + producers registration (linearized with Stop's set)
+    // 1) Producer gate: in-lock stopping check + producers registration
+    //    (gate closes at Stop's CAS(0->1) linearization point)
     if (!shEventProducerEnter(q)) {
         shEventDropInPlace(q, type, ctx, counter); // stopping: drop (balanced in place)
         return FALSE;
     }
 #ifdef SHINKEN_HOST_TEST
     if (ShEventTestBarrier)
-        ShEventTestBarrier(q); // barrier: pause holding the producers reference (T16 forced interleaving)
+        ShEventTestBarrier(q); // barrier: pause holding the producers reference (forced interleaving)
 #endif
     n = (SHINKEN_EVENT_NODE *)ShOps.AllocPool(sizeof(SHINKEN_EVENT_NODE), SHINKEN_EVENT_TAG);
     if (!n) {
@@ -156,9 +176,9 @@ BOOLEAN ShEventPost(SHINKEN_EVENT_QUEUE *q, UINT32 type, UINT64 ctx, volatile LO
     n->ctx = ctx;
     n->counter = counter;
     irql = ShOps.LockAcquireExclusive(q->lock);
-    // 2) In-lock recheck: between Enter and here Stop may have set stopping
-    //    (also in-lock) — on failure abandon the enqueue; node/counter/ctx all balanced in place
-    if (q->stopping) {
+    // 2) In-lock recheck: between Enter and here Stop may have advanced
+    //    stopping (atomic CAS); on failure abandon the enqueue; node/counter/ctx all balanced in place
+    if (shEventStoppingRead(q) != 0) {
         ShOps.LockReleaseExclusive(q->lock, irql);
         shEventProducerLeave(q);
         ShOps.FreePool(n, SHINKEN_EVENT_TAG);
@@ -167,7 +187,7 @@ BOOLEAN ShEventPost(SHINKEN_EVENT_QUEUE *q, UINT32 type, UINT64 ctx, volatile LO
     }
     // Queue full: drop-newest (drop the current new event), never block the
     // producer (telemetry must not stall classify); node/refs balanced in place
-    if (q->capacity > 0 && *q->pending >= q->capacity) {
+    if (q->capacity > 0 && SkAtAdd32((volatile LONG *)q->pending, 0) >= q->capacity) {
         ShOps.LockReleaseExclusive(q->lock, irql);
         shEventProducerLeave(q);
         ShOps.FreePool(n, SHINKEN_EVENT_TAG);
@@ -194,7 +214,8 @@ VOID ShEventThreadBody(PVOID ctx) {
         SHINKEN_EVENT_NODE *n;
         KIRQL irql;
         signaled = ShOps.EventWait(&q->doorbell, 100);
-        if (!signaled && shEventStoppingRead(q) && *q->pending == 0)
+        if (!signaled && shEventStoppingRead(q) != 0 &&
+            SkAtAdd32((volatile LONG *)q->pending, 0) == 0)
             return; // stopped and queue empty: exit (producer gate closed and drained, no new nodes)
         for (;;) {
             irql = ShOps.LockAcquireExclusive(q->lock);
@@ -209,9 +230,10 @@ VOID ShEventThreadBody(PVOID ctx) {
 }
 
 // Start/Stop mutual exclusion: the startLock critical section covers "check
-// stopping + create thread + publish threadObject" (Start) and "set stopping +
-// take threadObject" (Stop). Outcome is definite: Start first => Stop joins the
-// new thread; Stop first => Start is refused.
+// stopping + create thread + publish threadObject" (Start) and "take/clear
+// threadObject" (Stop). Outcome is definite: Start first => Stop joins the
+// new thread; Stop first => Start is refused (stopping 1 or 2 — the gate is
+// closing or closed; state 2 is terminal, never restart).
 // (All call sites are PASSIVE: ThreadCreate itself requires PASSIVE; CAS spin is legal.)
 NTSTATUS ShEventThreadStart(SHINKEN_EVENT_QUEUE *q) {
     NTSTATUS st;
@@ -220,10 +242,10 @@ NTSTATUS ShEventThreadStart(SHINKEN_EVENT_QUEUE *q) {
     if (!q || !q->head)
         return STATUS_INVALID_DEVICE_STATE; // queue uninitialized: do not start a thread
     while (SkAtCas32(&q->startLock, 1, 0) != 0)
-        ShOps.SleepMs(0); // yield (Stop critical section is very short)
-    if (q->stopping) {
+        ShOps.SleepMs(0); // yield (Start/Stop critical section is very short)
+    if (shEventStoppingRead(q) != 0) {
         q->startLock = 0;
-        return STATUS_INVALID_DEVICE_STATE; // already stopped: never restart (terminal semantics)
+        return STATUS_INVALID_DEVICE_STATE; // stopping/stopped: never restart (terminal semantics)
     }
     if (q->threadObject) {
         q->startLock = 0;
@@ -253,46 +275,85 @@ VOID ShEventDrain(SHINKEN_EVENT_QUEUE *q) {
 }
 
 NTSTATUS ShEventThreadStop(SHINKEN_EVENT_QUEUE *q) {
-    NTSTATUS st = STATUS_SUCCESS;
-    PVOID thr;
+    NTSTATUS result = STATUS_SUCCESS;
+    PVOID thr = NULL;
     ULONG i;
 
     if (!q || !q->head)
         return STATUS_SUCCESS; // queue uninitialized: nothing to stop or drain
-    // 1) Close the production entrance (set inside startLock; linearized with
-    //    Enter's in-lock check). Idempotent: a repeated Stop sees stopping
-    //    already set; the steps below are no-ops/fallbacks.
+
+    // 0) Elect exactly ONE stop executor: CAS 0->1. Any other concurrent Stop
+    //    caller (or a later idempotent Stop) takes the waiter path: it blocks
+    //    until state 2 is published and returns the SAME stopResult. Waiters
+    //    never touch threadObject, never join, never drain, never free — so a
+    //    failed stop cannot be "completed" early by a second caller.
+    if (SkAtCas32(&q->stopping, 1, 0) != 0) {
+        while (shEventStoppingRead(q) != 2)
+            ShOps.EventWait(&q->stopDone, 100); // bounded probe; state 2 is persistent (no lost wakeup)
+        return q->stopResult; // full-barrier publish (atomic Xchg) before state 2 was set
+    }
+
+    // --- single executor from here on; stopping == 1 (stop-in-progress) ---
+    // 1) Take threadObject under startLock (mutual exclusion with Start).
+    //    Ownership stays with the queue until a join CONFIRMS exit: on any
+    //    failure below threadObject is retained so a later Stop (or the
+    //    residency path) still knows the live thread.
     while (SkAtCas32(&q->startLock, 1, 0) != 0)
         ShOps.SleepMs(0);
-    SkAtXchg32(&q->stopping, 1);
     thr = q->threadObject;
-    q->threadObject = NULL;
     q->startLock = 0;
-    // 2) Wait for all entered producers to leave (any later Post must take the
-    //    drop path; no new node possible — precondition for join/drain)
+    // 2) Wait for all entered producers to leave (any later Post observes
+    //    stopping!=0 under the queue lock and drops; no new node possible —
+    //    precondition for join/drain)
     for (i = 0;; i++) {
         if (SkAtAdd32(&q->producers, 0) == 0)
             break;
-        if (i >= SH_EVENT_PRODUCER_WAIT_RETRIES)
-            return SHINKEN_STATUS_TIMEOUT; // producers stuck: caller stays resident
+        if (i >= SH_EVENT_PRODUCER_WAIT_RETRIES) {
+            result = SHINKEN_STATUS_TIMEOUT; // producers stuck: threadObject kept, caller stays resident
+            goto done;
+        }
         ShOps.SleepMs(SH_EVENT_PRODUCER_WAIT_DELAY_MS);
     }
     ShOps.EventSet(&q->doorbell); // 3) wake the consumer so it observes the stop
 
     if (thr) {
-        st = ShOps.ThreadJoin(thr); // 4) join (the consumer empties the queue before exiting)
-        if (st != STATUS_SUCCESS)
-            return st; // join failed (incl. positive): thread may still run => caller stays resident
+        result = ShOps.ThreadJoin(thr); // 4) join (the consumer empties the queue before exiting)
+        if (result != STATUS_SUCCESS)
+            goto done; // join failed (incl. positive): thread may still run => keep threadObject + ownership
+        // 5) confirmed exit: NOW — and only now — clear threadObject (under
+        //    startLock, the same critical section that publishes it).
+        while (SkAtCas32(&q->startLock, 1, 0) != 0)
+            ShOps.SleepMs(0);
+        if (q->threadObject == thr)
+            q->threadObject = NULL;
+        q->startLock = 0;
     }
-    ShEventDrain(q); // 5) fallback drain (guarantees release even if the thread never started)
-    if (*q->pending != 0)
-        return SHINKEN_STATUS_TIMEOUT;
-    return st;
+    ShEventDrain(q); // 6) fallback drain (guarantees release even if the thread never started)
+    if (SkAtAdd32((volatile LONG *)q->pending, 0) != 0) {
+        result = SHINKEN_STATUS_TIMEOUT; // queue cannot drain: ownership info kept
+        goto done;
+    }
+    result = STATUS_SUCCESS;
+done:
+    // Publish the outcome: result first, then the terminal state, then the
+    // wake. sk_atomic/SkOps ops are full barriers, so waiters that observe
+    // state 2 also observe stopResult.
+    q->stopResult = result;
+    SkAtXchg32(&q->stopping, 2); // stopped (terminal; idempotent repeat Stops return stopResult)
+    ShOps.EventSet(&q->stopDone);
+    return result;
 }
 
-LONG ShEventPending(SHINKEN_EVENT_QUEUE *q) { return *q->pending; }
+LONG ShEventPending(SHINKEN_EVENT_QUEUE *q) {
+    return SkAtAdd32((volatile LONG *)q->pending, 0); // unified atomic load (sk_atomic.h)
+}
 
-BOOLEAN ShEventThreadRunning(SHINKEN_EVENT_QUEUE *q) { return q->threadObject != NULL; }
+BOOLEAN ShEventThreadRunning(SHINKEN_EVENT_QUEUE *q) {
+    // TRUE only while a created thread is owned and not yet joined: after a
+    // successful Stop threadObject is NULL (cleared at step 5); after a FAILED
+    // Stop it stays non-NULL, truthfully reporting the still-live thread.
+    return SkAtAdd64((volatile LONG64 *)&q->threadObject, 0) != 0;
+}
 // ---------------------------------------------------------------------------
 // Inline record posting (ctx=0/counter=NULL; capacity/stop/alloc failure =>
 // dropped and counted; telemetry never blocks the verdict path)
@@ -320,12 +381,13 @@ BOOLEAN ShEventPostRecord(SHINKEN_EVENT_QUEUE *q, UINT32 type, const void *recor
     n->counter = NULL;
     RtlCopyMemory(n->payload, record, size); // copy into kernel-owned memory before enqueue
     irql = ShOps.LockAcquireExclusive(q->lock);
-    if (q->stopping || (q->capacity > 0 && *q->pending >= q->capacity)) {
+    if (shEventStoppingRead(q) != 0 ||
+        (q->capacity > 0 && SkAtAdd32((volatile LONG *)q->pending, 0) >= q->capacity)) {
         ShOps.LockReleaseExclusive(q->lock, irql);
         shEventProducerLeave(q);
         ShOps.FreePool(n, SHINKEN_EVENT_TAG);
         SkAtAdd64(&q->dropped, 1);
-        if (!q->stopping)
+        if (shEventStoppingRead(q) == 0)
             SkAtAdd64(&q->overflowDropped, 1);
         return FALSE;
     }
@@ -376,7 +438,7 @@ VOID SkTelemetryInit(void) {
 
 NTSTATUS SkTelemetryStart(void) { return ShEventThreadStart(&g_SkTelemetryQueue); }
 
-VOID SkTelemetryStop(void) { (VOID)ShEventThreadStop(&g_SkTelemetryQueue); }
+NTSTATUS SkTelemetryStop(void) { return ShEventThreadStop(&g_SkTelemetryQueue); }
 
 BOOLEAN SkTelemetryPost(UINT32 type, UINT64 ctx, volatile LONG *counter) {
     return ShEventPost(&g_SkTelemetryQueue, type, ctx, counter);
@@ -388,31 +450,44 @@ BOOLEAN SkTelemetryPostRecord(UINT32 type, const void *record, UINT32 size) {
 
 VOID SkTelemetryStats(UINT64 *posted, UINT64 *consumed, UINT64 *dropped,
                       UINT64 *overflowDropped) {
+    // Unified atomic loads (sk_atomic.h): the consumer updates these on
+    // another thread; diagnostic reads must not tear or cache.
     if (posted)
-        *posted = (UINT64)g_SkTelemetryQueue.posted;
+        *posted = (UINT64)SkAtAdd64((volatile LONG64 *)&g_SkTelemetryQueue.posted, 0);
     if (consumed)
-        *consumed = (UINT64)g_SkTelemetryQueue.consumed;
+        *consumed = (UINT64)SkAtAdd64((volatile LONG64 *)&g_SkTelemetryQueue.consumed, 0);
     if (dropped)
-        *dropped = (UINT64)g_SkTelemetryQueue.dropped;
+        *dropped = (UINT64)SkAtAdd64((volatile LONG64 *)&g_SkTelemetryQueue.dropped, 0);
     if (overflowDropped)
-        *overflowDropped = (UINT64)g_SkTelemetryQueue.overflowDropped;
+        *overflowDropped = (UINT64)SkAtAdd64((volatile LONG64 *)&g_SkTelemetryQueue.overflowDropped, 0);
 }
 
 UINT32 SkTelemetryFlush(void *out, UINT32 maxRecords, UINT32 recordSize) {
     // Copy the ring's current contents in write order into out (kernel buffer);
     // return the count. Copy only under the ring lock; an inconsistent snapshot
     // is acceptable (telemetry semantics).
+    // Per-record contract: exactly g_SkRingSize[idx] payload bytes are
+    // meaningful; the rest of the fixed-size record is ZEROED, so a short
+    // record never leaks stale bytes from a previously longer record that
+    // occupied the same ring slot or output buffer.
     KIRQL irql;
     UINT32 avail, start, i, n;
+    UINT64 total;
     if (!out || recordSize > SK_EVENT_PAYLOAD_SIZE || recordSize == 0)
         return 0;
     irql = ShOps.LockAcquireExclusive(&g_SkRingLock);
-    avail = g_SkRingTotal < SK_TELEMETRY_RING ? (UINT32)g_SkRingTotal : SK_TELEMETRY_RING;
+    total = (UINT64)SkAtAdd64((volatile LONG64 *)&g_SkRingTotal, 0);
+    avail = total < SK_TELEMETRY_RING ? (UINT32)total : SK_TELEMETRY_RING;
     n = avail < maxRecords ? avail : maxRecords;
     start = (g_SkRingHead + SK_TELEMETRY_RING - n) % SK_TELEMETRY_RING;
     for (i = 0; i < n; i++) {
         UINT32 idx = (start + i) % SK_TELEMETRY_RING;
-        RtlCopyMemory((UINT8 *)out + (UINT64)i * recordSize, g_SkRing[idx], recordSize);
+        UINT32 bytes = g_SkRingSize[idx];
+        UINT8 *dst = (UINT8 *)out + (UINT64)i * recordSize;
+        if (bytes > recordSize)
+            bytes = recordSize; // defensive: recordSize <= PAYLOAD_SIZE is checked above
+        RtlZeroMemory(dst, recordSize);
+        RtlCopyMemory(dst, g_SkRing[idx], bytes);
     }
     ShOps.LockReleaseExclusive(&g_SkRingLock, irql);
     return n;
