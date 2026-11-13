@@ -26,9 +26,7 @@ extern "C" {
 // ---------------------------------------------------------------------------
 // Sync primitive abstraction (kernel: KEVENT/thread object; host: Win32 event/thread, same storage)
 // ---------------------------------------------------------------------------
-typedef struct _SHINKEN_EVENT {
-    long x[8]; // kernel: first 0x18 bytes are a KEVENT; host: first field holds HANDLE
-} SHINKEN_EVENT;
+typedef KEVENT SHINKEN_EVENT;
 
 typedef VOID (*SHINKEN_THREAD_FN)(PVOID ctx);
 
@@ -95,19 +93,10 @@ typedef struct _SHINKEN_WFP_OBJECT {
 typedef struct _SHINKEN_OPS {
     // --- WFP unregister/delete (all return values must be checked) ---
     NTSTATUS (*UnregisterCalloutById)(UINT32 id);
-    NTSTATUS (*UnregisterCalloutByKey)(const GUID *key);
-    NTSTATUS (*FilterDeleteById)(HANDLE engine, UINT64 filterId);
-    NTSTATUS (*FilterDeleteByKey)(HANDLE engine, const GUID *key);
-    NTSTATUS (*CalloutDeleteById)(HANDLE engine, UINT32 id);
-    NTSTATUS (*CalloutDeleteByKey)(HANDLE engine, const GUID *key);
-    NTSTATUS (*ProviderDeleteByKey)(HANDLE engine, const GUID *key);
-    NTSTATUS (*SubLayerDeleteByKey)(HANDLE engine, const GUID *key);
     NTSTATUS (*EngineClose)(HANDLE engine);
     NTSTATUS (*InjectionHandleDestroy)(HANDLE handle);
     NTSTATUS (*FlowRemoveContext)(UINT64 flowId, UINT16 layerId, UINT32 calloutId);
     NTSTATUS (*BfeUnsubscribe)(HANDLE changeHandle);
-    // --- work item ---
-    NTSTATUS (*WorkItemFlush)(PVOID workItem);
     // --- memory (event nodes) ---
     PVOID (*AllocPool)(ULONG size, ULONG tag);
     VOID (*FreePool)(PVOID block, ULONG tag);
@@ -130,23 +119,14 @@ typedef struct _SHINKEN_OPS {
 
 extern SHINKEN_OPS ShOps;
 
-// Test hook (always NULL in kernel builds; see ShRuntimeBlockUnloadForever)
-typedef struct _SHINKEN_TEST_HOOK {
-    int (*AbortBlockedWait)(ULONG iteration); // nonzero => break out of resident wait (tests only)
-} SHINKEN_TEST_HOOK;
-extern SHINKEN_TEST_HOOK *ShTestHook;
 #ifndef SHINKEN_STATUS_TIMEOUT
 #define SHINKEN_STATUS_TIMEOUT ((NTSTATUS)0x00000102L) // STATUS_TIMEOUT
 #endif
 
-// WFP documented "object not found" statuses (winerror.h); only these plus
-// STATUS_SUCCESS may mark an object Deleted — every other error means the
-// clear state is untrustworthy:
-#ifndef FWP_E_CALLOUT_NOT_FOUND
-#define FWP_E_CALLOUT_NOT_FOUND  ((NTSTATUS)0x80320001L) // callout not found
-#define FWP_E_FILTER_NOT_FOUND   ((NTSTATUS)0x80320003L) // filter not found
-#define FWP_E_PROVIDER_NOT_FOUND ((NTSTATUS)0x80320005L) // provider not found
-#define FWP_E_SUBLAYER_NOT_FOUND ((NTSTATUS)0x80320007L) // sublayer not found
+// Kernel WFP APIs return NTSTATUS (0xC022xxxx), not the user-mode
+// FWP_E_* HRESULT values (0x8032xxxx). The shim needs these definitions.
+#ifndef STATUS_FWP_CALLOUT_NOT_FOUND
+#define STATUS_FWP_CALLOUT_NOT_FOUND  ((NTSTATUS)0xC0220001L)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -170,14 +150,13 @@ ULONG ShRuntimeBlockHistoryCount(void);                    // total recorded rea
 SHINKEN_BLOCK_REASON ShRuntimeBlockHistoryAt(ULONG index); // out of range => ShinkenBlockNone
 VOID ShRuntimeEnterQuiescent(void);                  // Teardown -> Quiescent
 VOID ShRuntimeEnterUnloadBlocked(SHINKEN_BLOCK_REASON why); // -> terminal (idempotent, keeps first cause)
-VOID ShRuntimeBlockUnloadForever(void);              // resident wait (test hook may break out)
+VOID ShRuntimeBlockUnloadForever(void);              // resident wait; never returns
 // Unified unload gate: all quiesce pass => cleanup; else UNLOAD_BLOCKED +
 // residency. After cleanup returns, state is re-checked: a drain failure
 // discovered inside cleanup (e.g. rule snapshot readers stuck) enters
 // UNLOAD_BLOCKED — once blocked, never return TRUE (returning lets KMDF
 // unload the image).
-// Returns TRUE if cleanup completed and runtime is still Quiescent (normal
-// unload); FALSE means residency (test hook broke out).
+// Returns TRUE only after confirmed cleanup; failure parks indefinitely.
 BOOLEAN ShRuntimeRunUnload(BOOLEAN (*sensorQuiesce)(VOID), BOOLEAN (*divertQuiesce)(VOID),
                            VOID (*sensorCleanup)(VOID), VOID (*divertCleanup)(VOID));
 
@@ -187,19 +166,6 @@ BOOLEAN ShRuntimeRunUnload(BOOLEAN (*sensorQuiesce)(VOID), BOOLEAN (*divertQuies
 // ---------------------------------------------------------------------------
 VOID ShWfpObjectInit(SHINKEN_WFP_OBJECT *o, const char *name, UINT32 calloutId, UINT64 filterId,
                      const GUID *key);
-VOID ShWfpObjectMark(SHINKEN_WFP_OBJECT *o, SHINKEN_WFP_OBJECT_STATE st);
-// Bounded BUSY-retry unregister; busyCleanup (strip flow contexts) runs between BUSY retries; exhausted => Leaked.
-NTSTATUS ShWfpUnregisterCalloutById(SHINKEN_WFP_OBJECT *o, PVOID busyCtx,
-                                    VOID (*busyCleanup)(PVOID), ULONG maxBusyRetries,
-                                    ULONG delayMs);
-NTSTATUS ShWfpUnregisterCalloutByKey(SHINKEN_WFP_OBJECT *o, ULONG maxBusyRetries, ULONG delayMs);
-NTSTATUS ShWfpDeleteFilterById(SHINKEN_WFP_OBJECT *o, HANDLE engine);
-NTSTATUS ShWfpDeleteFilterByKey(SHINKEN_WFP_OBJECT *o, HANDLE engine);
-NTSTATUS ShWfpDeleteCalloutById(SHINKEN_WFP_OBJECT *o, HANDLE engine);
-NTSTATUS ShWfpDeleteCalloutByKey(SHINKEN_WFP_OBJECT *o, HANDLE engine);
-NTSTATUS ShWfpDeleteProviderByKey(SHINKEN_WFP_OBJECT *o, HANDLE engine);
-NTSTATUS ShWfpDeleteSubLayerByKey(SHINKEN_WFP_OBJECT *o, HANDLE engine);
-NTSTATUS ShWfpEngineClose(SHINKEN_WFP_OBJECT *o, HANDLE engine);
 
 // ---------------------------------------------------------------------------
 // in-flight injection tracking — implemented on a dedicated rundown
@@ -228,7 +194,6 @@ LONG64 ShHandlesOpen(void);
 
 // In-flight tracking for BFE state callbacks (shared by sensor + divert)
 extern SHINKEN_RUNDOWN ShRundownBfe;
-extern SHINKEN_RUNDOWN ShRundownWorkItem; // Io* work item(SHINKEN fw-event worker)
 
 #ifdef __cplusplus
 }

@@ -10,10 +10,8 @@
 //     in-flight -> ShInjectionDestroyTracked destroys the handles
 //     (bounded BUSY retries; unknown error/exhausted => Leaked =>
 //     caller parks);
-//   * self-injection guard: SK_INJECT_TAG is written into the low 32
-//     bits of the injection context at submit time; SkInjectIsSelf in
-//     classify permits such packets directly, preventing
-//     re-classification loops.
+//   * ALE flowContext is not an injection context. Packet injection state
+//     must be queried through WFP when an injection data path is added.
 //
 // Reference-pairing contract for wiring a reinject callout:
 //   * ShInjectionBegin() must succeed before queueing/submitting;
@@ -47,20 +45,8 @@ static LONG g_SkInjectQuiesced; // set by a fully successful quiesce: the inject
                                 // rundown gate is then permanently stopped, so
                                 // SkInjectInit refuses re-init (provable re-init semantics)
 
-// create injection handles + NBL/NB pools; all return values checked; partial failure rolls back what was built.
-//
-// State-bit discipline (P2 defect fix — must be provable):
-//   g_SkInjectInited==1  <=>  handles[0..1] and pools exist and are usable;
-//   g_SkInjectInited==0  <=>  none of them is relied upon (nothing created, or
-//                             fully quiesced/destroyed, or a failed init that
-//                             rolled everything back).
-// The claim is a single CAS; EVERY failure path below resets the bit to 0
-// after rolling back the resources claimed so far, so the invariant "bit ==
-// resources" holds after any return. A second Init while initialized is a
-// no-op success (idempotent). After a successful quiesce the gate rundown's
-// stop bit is irreversible (rundown.h invariant 7): re-init would create
-// handles behind a permanently closed ShInjectionBegin gate, so it is
-// refused with STATUS_INVALID_DEVICE_STATE and the bit stays 0.
+// DriverEntry is the sole initializer. Publish readiness only after all
+// resources exist; partial failure uses the same tracked teardown path.
 NTSTATUS SkInjectInit(void) {
     NET_BUFFER_LIST_POOL_PARAMETERS nblParams;
     NET_BUFFER_POOL_PARAMETERS nbParams;
@@ -68,8 +54,8 @@ NTSTATUS SkInjectInit(void) {
 
     if (SkAtOr32(&g_SkInjectQuiesced, 0))
         return STATUS_INVALID_DEVICE_STATE; // gate permanently stopped; re-init refused, bit stays 0
-    if (SkAtCas32(&g_SkInjectInited, 1, 0) != 0)
-        return STATUS_SUCCESS; // already initialized: bit==1 => handles+pools exist (invariant below)
+    if (SkAtOr32(&g_SkInjectInited, 0))
+        return STATUS_SUCCESS;
 
     ShWfpObjectInit(&g_InjectionTrack[0], "injectHandleV4", 0, 0, NULL);
     ShWfpObjectInit(&g_InjectionTrack[1], "injectHandleV6", 0, 0, NULL);
@@ -83,10 +69,7 @@ NTSTATUS SkInjectInit(void) {
     st = FwpsInjectionHandleCreate0(AF_INET6, 0, &g_InjectionHandle[1]);
     if (!NT_SUCCESS(st)) {
         g_InjectionHandle[1] = NULL;
-        ShOps.InjectionHandleDestroy(g_InjectionHandle[0]); // roll back the v4 handle already created
-        g_InjectionHandle[0] = NULL;
-        g_SkInjectInited = 0;
-        return st;
+        goto rollback;
     }
 
     // NDIS_OBJECT_HEADER must carry Type/Revision: with only Size set,
@@ -99,11 +82,8 @@ NTSTATUS SkInjectInit(void) {
     nblParams.PoolTag = SK_NBL_POOL_TAG;
     g_SkNblPool = NdisAllocateNetBufferListPool(NULL, &nblParams);
     if (g_SkNblPool == NULL) {
-        ShOps.InjectionHandleDestroy(g_InjectionHandle[1]);
-        ShOps.InjectionHandleDestroy(g_InjectionHandle[0]);
-        g_InjectionHandle[0] = g_InjectionHandle[1] = NULL;
-        g_SkInjectInited = 0;
-        return STATUS_INSUFFICIENT_RESOURCES;
+        st = STATUS_INSUFFICIENT_RESOURCES;
+        goto rollback;
     }
 
     RtlZeroMemory(&nbParams, sizeof(nbParams));
@@ -113,15 +93,18 @@ NTSTATUS SkInjectInit(void) {
     nbParams.PoolTag = SK_NB_POOL_TAG;
     g_SkNbPool = NdisAllocateNetBufferPool(NULL, &nbParams);
     if (g_SkNbPool == NULL) {
-        NdisFreeNetBufferListPool(g_SkNblPool);
-        g_SkNblPool = NULL;
-        ShOps.InjectionHandleDestroy(g_InjectionHandle[1]);
-        ShOps.InjectionHandleDestroy(g_InjectionHandle[0]);
-        g_InjectionHandle[0] = g_InjectionHandle[1] = NULL;
-        g_SkInjectInited = 0;
-        return STATUS_INSUFFICIENT_RESOURCES;
+        st = STATUS_INSUFFICIENT_RESOURCES;
+        goto rollback;
     }
+    SkAtXchg32(&g_SkInjectInited, 1);
     return STATUS_SUCCESS;
+rollback:
+    if (!SkInjectQuiesce()) {
+        ShRuntimeEnterUnloadBlocked(ShinkenBlockInjectionDrain);
+        return st;
+    }
+    SkInjectDestroy();
+    return st;
 }
 
 // quiesce: close gate -> drain in-flight -> destroy both injection handles.
@@ -133,8 +116,6 @@ BOOLEAN SkInjectQuiesce(void) {
     NTSTATUS st;
     ULONG i;
 
-    if (!SkAtOr32(&g_SkInjectInited, 0))
-        return TRUE; // idempotent: uninitialized = nothing to quiesce (atomic state-bit read)
 
     ShInjectionGateStop();
     st = ShInjectionDrain(SK_INJECT_DRAIN_RETRIES, SK_INJECT_RETRY_DELAY_MS);
@@ -177,7 +158,3 @@ VOID SkInjectDestroy(void) {
     }
 }
 
-// self-injection check: this driver's packets carry SK_INJECT_TAG in the low 32 bits of the injection context.
-BOOLEAN SkInjectIsSelf(UINT64 injectionContext) {
-    return (BOOLEAN)((UINT32)(injectionContext & 0xFFFFFFFFu) == SK_INJECT_TAG);
-}

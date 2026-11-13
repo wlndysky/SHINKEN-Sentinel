@@ -27,32 +27,22 @@
 //     classifyOut write on the right). Finality: a written BLOCK always
 //     clears the WRITE right (a veto consumes it). A written PERMIT
 //     clears the WRITE right ONLY when the matched filter carries
-//     FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT — the driver's own filters are
-//     added with FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT (wfp_objects.c), so
-//     its permit is final; for a foreign filter without the flag the
-//     right survives and lower-priority sublayers keep arbitrating. The
-//     BLOCK verdict computed here is an internal decision of this
-//     callout — whether the kernel actually drops the connection is the
-//     platform's arbitration outcome (a hardened VM may ignore
-//     third-party callout verdicts entirely), so no comment here may
-//     describe the verdict as a guaranteed Windows-enforced BLOCK.
+//     FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT. Our filters use flags=0, so
+//     permits stay soft and other security providers can still block.
+//     A foreign filter may request finality. BLOCK is an internal decision of
+//     this callout; the final network outcome depends on WFP arbitration.
 //     BLOCK is only computed on ALE_AUTH_* (hardBlockAllowed=1); layers
 //     with hardBlockAllowed==0 (FLOW_ESTABLISHED_*) only PERMIT even
 //     when the computed verdict is BLOCK (never forced BLOCK).
 //   * FLOW_ESTABLISHED_*: always PERMIT, no rule evaluation; only
 //     attach/reuse the flow context (release is flowDelete/RemoveAll's
 //     job; attach failure does not affect the permit).
-//   * self-injection: packets whose flowContext low 32 bits equal
-//     SK_INJECT_TAG (injected by this driver) are permitted directly,
-//     skipping rule evaluation (no re-classification/infinite loop;
-//     see injection.h).
 //   * telemetry delivery failure never affects the verdict.
 // ============================================================================
 #include <ntddk.h>
 #include "../runtime/sk_atomic.h"
 #include "classify.h"
 #include "flow_context.h"
-#include "injection.h"
 #include "../telemetry/event_queue.h"
 #include "../control/protocol.h" // SK_EVENT_RECORD (audit telemetry record wire format)
 #include "../wfp/wfp_callouts.h" // SK_LAYER_ID + hardBlockAllowed
@@ -108,14 +98,6 @@ static BOOLEAN skFilterClearsActionRight(const FWPS_FILTER1 *filter) {
 }
 #endif
 
-// ---------------------------------------------------------------------------
-// Self-injection guard: packets injected by this driver (context low
-// 32 bits == SK_INJECT_TAG) are permitted directly — no
-// re-classification / infinite loop (injection.h contract).
-// ---------------------------------------------------------------------------
-static BOOLEAN skClassifySelfInjected(UINT64 flowContext) {
-    return SkInjectIsSelf(flowContext);
-}
 
 // ---------------------------------------------------------------------------
 // inFixedValues field reads (check valueCount first to prevent
@@ -138,7 +120,7 @@ static VOID skFieldAddr(const FWPS_INCOMING_VALUES0 *in, UINT32 idx, UINT32 fami
     if (in->valueCount <= idx)
         return; // missing: keep 0 (wildcard semantics decided by the rule-side mask)
     if (family == AF_INET) {
-        UINT32 v = in->incomingValue[idx].value.uint32; // network-order uint32
+        UINT32 v = in->incomingValue[idx].value.uint32; // host-order WFP IPv4 value
         out[0] = (UINT8)(v >> 24);                      // store big-endian
         out[1] = (UINT8)(v >> 16);
         out[2] = (UINT8)(v >> 8);
@@ -333,17 +315,7 @@ static VOID skClassifyAleCommon(UINT32 layerId,
 
     if (classifyOut == NULL)
         return;
-    if (skClassifySelfInjected(flowContext)) {
-        // self-injected packet: permit directly (verdict-rights contract:
-        // write only while holding the WRITE right; the right is consumed
-        // only when the matched filter declared CLEAR_ACTION_RIGHT)
-        if (classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) {
-            classifyOut->actionType = FWP_ACTION_PERMIT;
-            if (skFilterClearsActionRight(filter))
-                classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
-        }
-        return;
-    }
+    UNREFERENCED_PARAMETER(flowContext);
     SkClassifyBuildTuple(layerId, inFixed, meta, &tuple);
     SkClassifyApplyVerdict(layerId, &tuple, filter, classifyOut);
 }
@@ -371,8 +343,7 @@ static VOID skClassifyFlowCommon(UINT32 layerId,
         if (skFilterClearsActionRight(filter))
             classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
     }
-    if (skClassifySelfInjected(flowContext))
-        return;
+    UNREFERENCED_PARAMETER(flowContext);
 #ifdef SHINKEN_HOST_SHIM
     if (meta == NULL || meta->flowHandle == 0)
         return;

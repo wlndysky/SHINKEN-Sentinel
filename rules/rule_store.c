@@ -44,13 +44,19 @@
 //   Snapshots are immutable: every write copies->validates->sorts->publishes
 //     a new snapshot (version+1); failure paths never touch g_Current — the
 //     old rule set stays in effect.
+// RATE_LIMIT buckets are allocated only by writers and reference-counted by
+// snapshots. Equal id/rate/interval/burst shares state. A burst-only change
+// copies the live state into a separately locked bucket and clamps the copy;
+// other parameter changes and disables start full. Allocation or publication
+// failure never mutates the current bucket. In-flight readers finish on their
+// snapshot's objects; a changed burst captures state during snapshot building,
+// not a globally atomic accounting boundary across the two policy versions.
 //   Write gate: after teardown (ShRuntimeIsActive()==FALSE) or store close,
 //     all writes return STATUS_INVALID_DEVICE_STATE.
 // ============================================================================
 #include <ntddk.h>
 #include "../runtime/sk_atomic.h"
 #include "rule_store.h"
-#include "rule_engine.h"          // SkRuleRateReset (bucket cleanup on delete/disable)
 #include "../wfp/wfp_callouts.h"  // SK_LAYER_COUNT (layerId range validation)
 #include "../control/protocol.h"  // SK_RULE_MAX / SK_REPLACE_MAX_BYTES
 
@@ -70,7 +76,7 @@
     ((type *)((char *)(addr) - __builtin_offsetof(type, field)))
 #endif
 
-#define SK_RULE_POOL_TAG 'lRuS' // 'SuRl' rule snapshot pool
+#define SK_RULE_POOL_TAG 'lRuS' // 'SuRl' rule snapshot/bucket pool
 
 // Pre-publish retire drain: 50 x 1ms bounded retries (readers at DISPATCH
 // hold only a very short path; normally drained on round 0; leftovers retry
@@ -94,8 +100,7 @@ static BOOLEAN g_StoreClosed;                // cannot revive after Shutdown
 // Host-test barrier hook (test builds only; unreferenced in kernel builds):
 // called inside reader section R after g_Current was read but before
 // ShRundownAcquire, to force the most dangerous "reader vs publish/close"
-// interleaving (same pattern as telemetry's
-// ShEventTestBarrier).
+// interleaving.
 VOID (*ShRuleStoreTestBarrier)(const SK_RULE_SNAPSHOT *snap);
 #endif
 
@@ -121,8 +126,8 @@ static BOOLEAN SkStoreWritableNoLock(void) {
     return (BOOLEAN)(g_StoreInited && !g_StoreClosed && ShRuntimeIsActive());
 }
 
-// Snapshot alloc/free (two pool blocks: array + header; rules is NULL when
-// count==0)
+// Snapshot alloc/free (pool blocks: header + rule array + bucket pointer
+// array; rules/buckets are NULL when count==0)
 static SK_RULE_SNAPSHOT *SkSnapAlloc(void) {
     SK_RULE_SNAPSHOT *s = (SK_RULE_SNAPSHOT *)ShOps.AllocPool(sizeof(SK_RULE_SNAPSHOT),
                                                               SK_RULE_POOL_TAG);
@@ -134,7 +139,58 @@ static SK_RULE_SNAPSHOT *SkSnapAlloc(void) {
     return s;
 }
 
+// ---- RATE_LIMIT bucket lifecycle (writer path only; refcount transitions
+// are storeLock-serialized, so a plain counter is exact) ----
+
+// Optional source is used only for a burst-only change. Copy under its lock;
+// never clamp the source while the new snapshot can still fail publication.
+static SK_RATE_BUCKET *SkRateBucketCreate(UINT32 burst, SK_RATE_BUCKET *source) {
+    SK_RATE_BUCKET *b = (SK_RATE_BUCKET *)ShOps.AllocPool(sizeof(SK_RATE_BUCKET),
+                                                          SK_RULE_POOL_TAG);
+    if (b == NULL)
+        return NULL;
+    RtlZeroMemory(b, sizeof(*b));
+    b->tokens = burst;
+    b->refs = 1; // creator: the snapshot being built
+    if (source != NULL) {
+        KIRQL irql = ShOps.LockAcquireExclusive(&source->lock);
+        b->tokens = source->tokens < burst ? source->tokens : burst;
+        b->lastRefillMs = source->lastRefillMs;
+        b->started = source->started;
+        ShOps.LockReleaseExclusive(&source->lock, irql);
+    }
+    return b;
+}
+
+static VOID SkRateBucketRef(SK_RATE_BUCKET *bucket) {
+    bucket->refs += 1; // the sharer's own reference keeps refs >= 1 below
+}
+
+static VOID SkRateBucketRelease(SK_RATE_BUCKET *bucket) {
+    bucket->refs -= 1;
+    if (bucket->refs == 0)
+        ShOps.FreePool(bucket, SK_RULE_POOL_TAG);
+}
+
+// Bucket array teardown: release every carried reference (the last release
+// frees the object) and free the parallel array itself. count==0 snapshots
+// carry a NULL array.
+static VOID SkBucketsReleaseAll(SK_RATE_BUCKET **buckets, UINT32 count) {
+    UINT32 i;
+    if (buckets == NULL)
+        return;
+    for (i = 0; i < count; i++) {
+        if (buckets[i] != NULL)
+            SkRateBucketRelease(buckets[i]);
+    }
+    ShOps.FreePool(buckets, SK_RULE_POOL_TAG);
+}
+
 static VOID SkSnapFree(SK_RULE_SNAPSHOT *s) {
+    // Only called after the snapshot became unreachable (drained retire
+    // entry, consumed rollback slot, failed publish): no classify reader can
+    // still hold it, so releasing its bucket references is safe.
+    SkBucketsReleaseAll(s->buckets, s->count);
     if (s->rules != NULL)
         ShOps.FreePool(s->rules, SK_RULE_POOL_TAG);
     ShOps.FreePool(s, SK_RULE_POOL_TAG);
@@ -166,16 +222,49 @@ static BOOLEAN SkRulePrecedes(const SK_RULE *a, const SK_RULE *b) {
     return (BOOLEAN)(a->ruleId < b->ruleId);
 }
 
-// Insertion sort (write path PASSIVE, count <= SK_RULE_MAX=4096; low update
-// rate, simple and stable beats fancy). A sorted snapshot makes the first
-// match during a classify scan the verdict.
+// Heapsort on the verdict order (write path PASSIVE, count <=
+// SK_RULE_MAX=4096): in place, no extra allocation, O(n log n) even at the
+// cap. The comparator is a total order over distinct rule ids, so the result
+// is unique (identical to the previous insertion sort): a[0] ends up the
+// most-preceding rule, because the heap keeps the LEAST-preceding entry at
+// the root and extraction moves it to the tail. A sorted snapshot makes the
+// first match during a classify scan the verdict.
+static VOID SkSiftDown(SK_RULE *a, UINT32 root, UINT32 end) { // end inclusive
+    for (;;) {
+        UINT32 child = 2 * root + 1;
+        UINT32 top; // the less-preceding of the two children
+        SK_RULE t;
+        if (child > end)
+            return;
+        top = child;
+        if (child + 1 <= end && SkRulePrecedes(&a[child], &a[child + 1]))
+            top = child + 1; // a[child] precedes its sibling => sibling stays lower
+        if (!SkRulePrecedes(&a[root], &a[top]))
+            return; // root is not above the children: heap property holds
+        // root outranks the lowest child => push it down, keep the least-
+        // preceding entry on top
+        t = a[root];
+        a[root] = a[top];
+        a[top] = t;
+        root = top;
+    }
+}
+
 static VOID SkSortRules(SK_RULE *a, UINT32 n) {
-    UINT32 i, j;
-    for (i = 1; i < n; i++) {
-        SK_RULE t = a[i];
-        for (j = i; j > 0 && SkRulePrecedes(&t, &a[j - 1]); j--)
-            a[j] = a[j - 1];
-        a[j] = t;
+    UINT32 start, end;
+    SK_RULE t;
+    if (n < 2)
+        return;
+    start = n / 2; // one past the last parent; the loop pre-decrements
+    do {
+        start--;
+        SkSiftDown(a, start, n - 1);
+    } while (start != 0);
+    for (end = n - 1; end > 0; end--) { // extract the least-preceding root to the tail
+        t = a[0];
+        a[0] = a[end];
+        a[end] = t;
+        SkSiftDown(a, 0, end - 1);
     }
 }
 
@@ -215,41 +304,88 @@ static VOID SkRetireDrain(ULONG retries) {
     }
 }
 
-// Free RATE_LIMIT buckets of removed rules (snapshot-independent mutable
-// state; cleared as soon as the rule disappears)
-static VOID SkRateResetRemoved(const SK_RULE_SNAPSHOT *oldSnap, const SK_RULE_SNAPSHOT *newSnap) {
-    UINT32 i, j;
-    if (oldSnap == NULL)
-        return;
-    for (i = 0; i < oldSnap->count; i++) {
-        UINT64 id = oldSnap->rules[i].ruleId;
-        BOOLEAN present = FALSE;
-        if (newSnap != NULL) {
-            for (j = 0; j < newSnap->count; j++) {
-                if (newSnap->rules[j].ruleId == id) {
-                    present = TRUE;
-                    break;
+// Build the parallel bucket array for the next snapshot (writer path; the
+// caller holds storeLock, so `share` is stable and every refcount transition
+// is serialized). buckets[i] != NULL iff rules[i].action == RATE_LIMIT.
+// Reuse equal id/rate/interval/burst for enabled rules. Burst-only changes
+// clone and clamp into a new object; other changes or disables start full.
+// Failed builds release only their references and never mutate live tokens.
+static NTSTATUS SkBucketsBuild(const SK_RULE_SNAPSHOT *share, const SK_RULE *rules,
+                               UINT32 count, SK_RATE_BUCKET ***outBuckets) {
+    SK_RATE_BUCKET **arr = NULL;
+    UINT32 i, j = 0;
+    if (count != 0) {
+        arr = (SK_RATE_BUCKET **)ShOps.AllocPool(count * sizeof(SK_RATE_BUCKET *),
+                                                 SK_RULE_POOL_TAG);
+        if (arr == NULL)
+            return STATUS_INSUFFICIENT_RESOURCES;
+        RtlZeroMemory(arr, count * sizeof(SK_RATE_BUCKET *));
+    }
+    for (i = 0; i < count; i++) {
+        if (rules[i].action == (UINT32)SkRuleActionRateLimit) {
+            SK_RATE_BUCKET *b = NULL;
+            if (rules[i].enabled != 0 && share != NULL) {
+                for (j = 0; j < share->count; j++) {
+                    const SK_RULE *o = &share->rules[j];
+                    if (o->ruleId == rules[i].ruleId &&
+                        o->action == (UINT32)SkRuleActionRateLimit &&
+                        o->rateTokens == rules[i].rateTokens &&
+                        o->rateIntervalMs == rules[i].rateIntervalMs &&
+                        share->buckets[j] != NULL) {
+                        b = share->buckets[j];
+                        break;
+                    }
                 }
             }
+            if (b != NULL && rules[i].burst == share->rules[j].burst) {
+                SkRateBucketRef(b);
+            } else {
+                b = SkRateBucketCreate(rules[i].burst, b);
+                if (b == NULL) {
+                    while (i-- > 0) {
+                        if (arr[i] != NULL)
+                            SkRateBucketRelease(arr[i]);
+                    }
+                    ShOps.FreePool(arr, SK_RULE_POOL_TAG);
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+            }
+            arr[i] = b;
         }
-        if (!present)
-            SkRuleRateReset(id);
     }
+    *outBuckets = arr;
+    return STATUS_SUCCESS;
 }
 
-// Atomic publish (caller holds storeLock; ownership of rules transfers and
-// failure paths free it here too). version = old current->version + 1
-// (monotonic); old current goes to the rollback slot; old slot retires.
+// Atomic publish (caller holds storeLock; ownership of rules and of the
+// built bucket array transfers, and failure paths free them here too).
+// version = old current->version + 1 (monotonic); old current goes to the
+// rollback slot; old slot retires. Buckets are built against the snapshot
+// being displaced (g_Current, stable under storeLock) before any state
+// changes: a bucket or header allocation failure returns with the store
+// fully on the old policy.
 static NTSTATUS SkPublish(SK_RULE *rules, UINT32 count, UINT32 defaultPolicy) {
     SK_RULE_SNAPSHOT *snap, *old, *rb;
+    SK_RATE_BUCKET **buckets;
     KIRQL irql;
+    NTSTATUS st;
+
+    old = (SK_RULE_SNAPSHOT *)g_Current;
+    st = SkBucketsBuild(old, rules, count, &buckets);
+    if (!NT_SUCCESS(st)) {
+        if (rules != NULL)
+            ShOps.FreePool(rules, SK_RULE_POOL_TAG);
+        return st; // nothing published; old policy and its buckets intact
+    }
     snap = SkSnapAlloc();
     if (snap == NULL) {
+        SkBucketsReleaseAll(buckets, count);
         if (rules != NULL)
             ShOps.FreePool(rules, SK_RULE_POOL_TAG);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     snap->rules = rules;
+    snap->buckets = buckets;
     snap->count = count;
     snap->defaultPolicy = defaultPolicy;
 
@@ -268,7 +404,6 @@ static NTSTATUS SkPublish(SK_RULE *rules, UINT32 count, UINT32 defaultPolicy) {
         SkSnapFree(snap);
         return STATUS_INVALID_DEVICE_STATE;
     }
-    old = (SK_RULE_SNAPSHOT *)g_Current;
     snap->version = old->version + 1;
     rb = g_RollbackSlot;
     g_RollbackSlot = old; // displaced snapshot kept for ROLLBACK (no BeginStop)
@@ -283,8 +418,6 @@ static NTSTATUS SkPublish(SK_RULE *rules, UINT32 count, UINT32 defaultPolicy) {
     SkAtFence(); // snapshot content visible before pointer publish (release semantics)
     g_Current = snap;
     ShOps.LockReleaseExclusive(&g_PublishLock, irql);
-
-    SkRateResetRemoved(old, snap);
     return STATUS_SUCCESS;
 }
 
@@ -583,9 +716,11 @@ NTSTATUS SkRuleStoreAdd(const SK_RULE *rule) {
         RtlCopyMemory(arr, cur->rules, n * sizeof(SK_RULE));
     arr[n] = *rule;
     SkSortRules(arr, n + 1);
+    // No post-publish bucket reset: the builder hands the new RATE_LIMIT
+    // rule a fresh full bucket (sharing is impossible here — id conflicts
+    // were rejected above), so a reused rule id never inherits the deleted
+    // rule's token state.
     st = SkPublish(arr, n + 1, cur->defaultPolicy);
-    if (NT_SUCCESS(st))
-        SkRuleRateReset(rule->ruleId); // rule id reuse guard: a new rule never inherits an old token bucket
     SkStoreUnlock();
     return st;
 }
@@ -622,19 +757,11 @@ NTSTATUS SkRuleStoreUpdate(const SK_RULE *rule) {
         RtlCopyMemory(arr, cur->rules, n * sizeof(SK_RULE));
     arr[i] = *rule;
     SkSortRules(arr, n);
+    // Bucket semantics on update live in SkBucketsBuild (share source =
+    // g_Current == cur): same rateTokens/rateIntervalMs + enabled keeps the
+    // token state, a burst shrink clamps it immediately; a rate-parameter
+    // change, disable or action change starts a fresh full bucket.
     st = SkPublish(arr, n, cur->defaultPolicy);
-    // Update keeps the token bucket for the same ruleId, but:
-    //   - rateTokens/rateIntervalMs changes reset the bucket immediately;
-    //   - burst shrink clamps the live token count immediately.
-    if (NT_SUCCESS(st) && rule->action == SkRuleActionRateLimit) {
-        const SK_RULE *oldRule = &cur->rules[i];
-        if (oldRule->rateTokens != rule->rateTokens ||
-            oldRule->rateIntervalMs != rule->rateIntervalMs) {
-            SkRuleRateReset(rule->ruleId);
-        } else if (rule->burst < oldRule->burst) {
-            SkRuleRateClampBurst(rule->ruleId, rule->burst);
-        }
-    }
     SkStoreUnlock();
     return st;
 }
@@ -704,9 +831,10 @@ NTSTATUS SkRuleStoreSetEnabled(UINT64 ruleId, BOOLEAN enabled) {
     }
     RtlCopyMemory(arr, cur->rules, n * sizeof(SK_RULE));
     arr[i].enabled = enabled ? 1 : 0; // sort keys (priority/action/id) unchanged; no re-sort
+    // The builder publishes a disabled RATE_LIMIT rule with a fresh
+    // (never-consumed) bucket, so a later re-enable cannot inherit stale
+    // tokens — the old reset-on-disable behavior, made structural.
     st = SkPublish(arr, n, cur->defaultPolicy);
-    if (NT_SUCCESS(st) && !enabled)
-        SkRuleRateReset(ruleId); // disabling clears the bucket (delete is covered by the SkPublish diff)
     SkStoreUnlock();
     return st;
 }
@@ -774,6 +902,7 @@ NTSTATUS SkRuleStoreRollback(void) {
     NTSTATUS st;
     SK_RULE_SNAPSHOT *snap, *old, *rb;
     SK_RULE *arr;
+    SK_RATE_BUCKET **buckets;
     KIRQL irql;
     SkStoreLock();
     if (!SkStoreWritableNoLock()) {
@@ -802,14 +931,29 @@ NTSTATUS SkRuleStoreRollback(void) {
         }
         RtlCopyMemory(arr, rb->rules, rb->count * sizeof(SK_RULE)); // already sorted
     }
+    // Buckets share from the CURRENT snapshot (stable under storeLock), not
+    // from the slot: a rule id unchanged in both versions resumes with the
+    // state it accumulated under the live version — the continuity the old
+    // version-independent bucket state had; dropped/changed ids get fresh
+    // full buckets via the standard build rules. Any build failure leaves
+    // the store fully on the current policy.
+    st = SkBucketsBuild((const SK_RULE_SNAPSHOT *)g_Current, arr, rb->count, &buckets);
+    if (!NT_SUCCESS(st)) {
+        if (arr != NULL)
+            ShOps.FreePool(arr, SK_RULE_POOL_TAG);
+        SkStoreUnlock();
+        return st;
+    }
     snap = SkSnapAlloc();
     if (snap == NULL) {
+        SkBucketsReleaseAll(buckets, rb->count);
         if (arr != NULL)
             ShOps.FreePool(arr, SK_RULE_POOL_TAG);
         SkStoreUnlock();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     snap->rules = arr;
+    snap->buckets = buckets;
     snap->count = rb->count;
     snap->defaultPolicy = rb->defaultPolicy;
 
@@ -838,7 +982,6 @@ NTSTATUS SkRuleStoreRollback(void) {
     InsertTailList(&g_RetireList, &rb->retireLink);
     ShOps.LockReleaseExclusive(&g_PublishLock, irql);
 
-    SkRateResetRemoved(old, snap);
     SkStoreUnlock();
     st = STATUS_SUCCESS;
     return st;

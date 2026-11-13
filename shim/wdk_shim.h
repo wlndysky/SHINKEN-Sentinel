@@ -23,6 +23,7 @@ extern "C" {
 #endif
 
 typedef int8_t   CHAR;      typedef uint8_t  UCHAR, BYTE, BOOLEAN;
+typedef BOOLEAN *PBOOLEAN;
 typedef int16_t  SHORT;     typedef uint16_t USHORT, WORD, WCHAR;
 typedef int32_t  LONG, INT; typedef uint32_t ULONG, UINT, DWORD;
 typedef int64_t  LONGLONG;  typedef uint64_t ULONGLONG, QWORD, ULONG64;
@@ -46,7 +47,7 @@ typedef LONG NTSTATUS;
 typedef CHAR KIRQL; typedef ULONG_PTR KSPIN_LOCK, *PKSPIN_LOCK;
 typedef ULONG EX_SPIN_LOCK;
 typedef EX_SPIN_LOCK *PEX_SPIN_LOCK;
-typedef PVOID PEPROCESS, PKTHREAD, PDEVICE_OBJECT, PDRIVER_OBJECT, PFILE_OBJECT;
+typedef PVOID PEPROCESS, PETHREAD, PKTHREAD, PACCESS_TOKEN, PDEVICE_OBJECT, PDRIVER_OBJECT, PFILE_OBJECT;
 typedef struct _MDL { struct _MDL *Next; int16_t Size; int16_t MdlFlags; void *Process; void *MappedSystemVa; void *StartVa; ULONG ByteCount; ULONG ByteOffset; } MDL, *PMDL;
 typedef struct _GUID { uint32_t Data1; uint16_t Data2, Data3; uint8_t Data4[8]; } GUID;
 typedef const GUID *LPCGUID, *PCGUID;
@@ -236,7 +237,16 @@ typedef PVOID WDFCONTEXT;
 typedef struct _WDF_REQUEST_PARAMETERS { ULONG Size; ULONG MinorFunction; ULONG MajorFunction; union { struct { ULONG IoControlCode; ULONG_PTR InputBufferLength; ULONG_PTR OutputBufferLength; } DeviceIoControl; UCHAR Raw[24]; } Parameters; UCHAR Rest[64]; } WDF_REQUEST_PARAMETERS;
 #define IRP_MJ_DEVICE_CONTROL 14
 typedef PVOID PIRP;
-typedef struct _SID { UCHAR Revision; UCHAR SubAuthorityCount; UCHAR IdentifierAuthority[6]; ULONG SubAuthority[1]; } SID;
+typedef struct _SID_IDENTIFIER_AUTHORITY { UCHAR Value[6]; } SID_IDENTIFIER_AUTHORITY;
+typedef struct _SID { UCHAR Revision; UCHAR SubAuthorityCount; SID_IDENTIFIER_AUTHORITY IdentifierAuthority; ULONG SubAuthority[1]; } SID, *PSID;
+typedef struct _SID_AND_ATTRIBUTES { PSID Sid; ULONG Attributes; } SID_AND_ATTRIBUTES;
+typedef struct _TOKEN_GROUPS { ULONG GroupCount; SID_AND_ATTRIBUTES Groups[1]; } TOKEN_GROUPS, *PTOKEN_GROUPS;
+typedef enum _TOKEN_INFORMATION_CLASS { TokenUser = 1, TokenGroups } TOKEN_INFORMATION_CLASS;
+typedef enum _SECURITY_IMPERSONATION_LEVEL {
+    SecurityAnonymous, SecurityIdentification, SecurityImpersonation, SecurityDelegation
+} SECURITY_IMPERSONATION_LEVEL, *PSECURITY_IMPERSONATION_LEVEL;
+#define SE_GROUP_ENABLED 0x00000004u
+#define SE_GROUP_USE_FOR_DENY_ONLY 0x00000010u
 typedef struct _FWPM_SESSION0 { GUID sessionKey; FWPM_DISPLAY_DATA0 displayData; UINT32 flags; UINT32 txnWaitTimeoutInMSec; DWORD processId; SID *sid; PWSTR username; BOOL kernelMode; } FWPM_SESSION0;
 typedef struct _WDFDEVICE_INIT WDFDEVICE_INIT, *PWDFDEVICE_INIT;
 typedef struct _WDF_OBJECT_ATTRIBUTES { ULONG Size; PVOID ContextTypeInfo; PVOID EvtCleanupCallback; PVOID EvtDestroyCallback; int ExecutionLevel; int SynchronizationScope; PVOID ParentObject; } WDF_OBJECT_ATTRIBUTES;
@@ -305,6 +315,11 @@ DECL0(NTSTATUS, WdfIoQueueReadyNotify);
 typedef struct _SK_SHIM_KMUTEX { LONG64 x[5]; } KMUTEX, *PKMUTEX; // shim opaque placeholder (real KMUTEX is 40B)
 DECL0(VOID, KeInitializeMutex); DECL0(LONG, KeReleaseMutex);
 DECL0(PVOID, IoGetCurrentProcess); DECL0(HANDLE, PsGetCurrentThreadId); DECL0(HANDLE, PsGetProcessId);
+DECL0(PETHREAD, PsGetCurrentThread);
+DECL0(PACCESS_TOKEN, PsReferenceImpersonationToken); DECL0(VOID, PsDereferenceImpersonationToken);
+DECL0(PACCESS_TOKEN, PsReferencePrimaryToken); DECL0(VOID, PsDereferencePrimaryToken);
+DECL0(NTSTATUS, SeQueryInformationToken); DECL0(BOOLEAN, SeTokenIsRestricted);
+DECL0(VOID, ExFreePool);
 DECL0(NTSTATUS, PsCreateSystemThread); DECL0(VOID, KeStackAttachProcess); DECL0(VOID, KeUnstackDetachProcess);
 DECL0(NTSTATUS, ObReferenceObjectByHandle); DECL0(VOID, ObfDereferenceObject); DECL0(VOID, ObfReferenceObject);
 DECL0(NTSTATUS, ZwClose); DECL0(NTSTATUS, ZwWaitForSingleObject); DECL0(PVOID, MmGetSystemRoutineAddress);

@@ -24,9 +24,10 @@
 //     FileCreates -> stop/join consumer + purge queue -> bounded-wait the
 //     handle count to zero -> only then may SkControlDestroy delete the device.
 //   * Privilege model: OPTION (a) handle-scoped capability (design note at
-//     SkIoctlQueryCallerPrivileged): privilege is decided ONCE at create, in
-//     the creating process's context, and cached in the per-handle context;
-//     modify commands check the cached flag, query commands are open.
+//     SkIoctlQueryCallerPrivileged): privilege is decided ONCE at create,
+//     against the creating thread's EFFECTIVE token (impersonation-aware,
+//     UAC deny-only aware), and cached in the per-handle context; modify
+//     commands check the cached flag, query commands are open.
 //     Exposure: the capability is bound to the handle object, so a handle
 //     duplicated into another process (DuplicateHandle / inheritance) carries
 //     it until close; there is no per-request re-evaluation.
@@ -45,7 +46,7 @@
 //     publishes atomically; parse failure never touches the store.
 //   * Completion: always WdfRequestSetInformation + WdfRequestComplete.
 // ============================================================================
-#include <ntddk.h>
+#include <ntifs.h>
 #include "../runtime/sk_atomic.h"
 #include <wdf.h>
 // CTL_CODE/METHOD_BUFFERED/FILE_ANY_ACCESS come from shim/wdk_shim.h
@@ -84,14 +85,20 @@ VOID SkDeviceDelete(void); // WdfObjectDelete(g_SkControlWdfDevice) + clear, ide
 #endif
 
 // ---------------------------------------------------------------------------
-// Privilege decision (at create, in the caller's process context, PASSIVE)
+// Privilege decision (at create, in the creating thread's context, PASSIVE)
 //
 // Chosen model: (a) create-time privilege cache = HANDLE-SCOPED CAPABILITY.
 // Why not (b) per-request authorization: a re-check on the dedicated consumer
 // thread would observe that thread's SYSTEM token, not the original
 // requester's; per-request capture+reference of the requester token is a
 // larger protocol with token-lifetime hazards. Model (a) decides once, in the
-// creating thread's process context, during IRP_MJ_CREATE dispatch (PASSIVE).
+// creating thread's context, during IRP_MJ_CREATE dispatch (PASSIVE).
+//
+// Decide against the creating thread's effective token. Impersonation takes
+// precedence over the process token, including in System threads; anonymous
+// and identification levels do not grant management capability. Require an
+// enabled, non-deny-only Administrators group and reject restricted tokens.
+// Any token lookup/query failure denies modification.
 //
 // Exposure surface (kept explicit on purpose): the cached flag is a property
 // of the FILE OBJECT, so any handle duplicated into another process
@@ -111,22 +118,67 @@ VOID SkDeviceDelete(void); // WdfObjectDelete(g_SkControlWdfDevice) + clear, ide
 // source-only release; the harness lives outside it); no default here
 BOOLEAN SkIoctlQueryCallerPrivileged(void);
 #else
-// Defense in depth on top of the device SDDL (GA only for SY/BA): privileged
-// iff System process (PID 4, covers LocalSystem services) or the process
-// primary token is Administrators; token lookup failure -> default deny.
-PVOID PsReferencePrimaryToken(PEPROCESS process);
-VOID PsDereferencePrimaryToken(PVOID token);
-BOOLEAN SeTokenIsAdmin(PVOID token);
-BOOLEAN SkIoctlQueryCallerPrivileged(void) {
-    PVOID token;
+
+// BUILTIN\Administrators = S-1-5-32-544 (SECURITY_NT_AUTHORITY {0,0,0,0,0,5},
+// SECURITY_BUILTIN_DOMAIN_RID 32, DOMAIN_ALIAS_RID_ADMINS 544). Structural
+// compare — the only SID the control plane looks for.
+static BOOLEAN skSidIsBuiltinAdmins(const SID *sid) {
+    ULONG i;
+    if (sid->Revision != 1 || sid->SubAuthorityCount != 2)
+        return FALSE;
+    for (i = 0; i < 5; i++)
+        if (sid->IdentifierAuthority.Value[i] != 0)
+            return FALSE;
+    return sid->IdentifierAuthority.Value[5] == 5 &&
+           sid->SubAuthority[0] == 32 && sid->SubAuthority[1] == 544;
+}
+
+// Require an unrestricted effective token with an enabled admin group.
+// Restricted tokens need a separate restricting-SID access check; they never
+// receive this broad policy-management capability. Query failure denies.
+static BOOLEAN skTokenHasEnabledAdminGroup(PACCESS_TOKEN token) {
+    PTOKEN_GROUPS groups = NULL;
     BOOLEAN admin = FALSE;
-    if ((HANDLE)(uintptr_t)PsGetCurrentProcessId() == (HANDLE)4)
-        return TRUE; // System process / LocalSystem
-    token = PsReferencePrimaryToken(IoGetCurrentProcess());
-    if (token) {
-        admin = SeTokenIsAdmin(token);
-        PsDereferencePrimaryToken(token);
+    ULONG i;
+    if (SeTokenIsRestricted(token))
+        return FALSE;
+    if (SeQueryInformationToken(token, TokenGroups, (PVOID *)&groups) != STATUS_SUCCESS ||
+        groups == NULL)
+        return FALSE;
+    for (i = 0; i < groups->GroupCount; i++) {
+        if ((groups->Groups[i].Attributes & (SE_GROUP_ENABLED | SE_GROUP_USE_FOR_DENY_ONLY)) ==
+                SE_GROUP_ENABLED &&
+            skSidIsBuiltinAdmins((const SID *)groups->Groups[i].Sid)) {
+            admin = TRUE;
+            break;
+        }
     }
+    ExFreePool(groups);
+    return admin;
+}
+
+// Impersonation is authoritative even in the System process. Low-level
+// impersonation cannot grant the service's primary-token capability.
+BOOLEAN SkIoctlQueryCallerPrivileged(void) {
+    SECURITY_IMPERSONATION_LEVEL level;
+    BOOLEAN copyOnOpen, effectiveOnly, admin;
+    PACCESS_TOKEN token;
+
+    // Never replace an impersonating client's identity with the service's.
+    token = PsReferenceImpersonationToken(PsGetCurrentThread(), &copyOnOpen,
+                                          &effectiveOnly, &level);
+    if (token != NULL) {
+        admin = (level >= SecurityImpersonation) &&
+                skTokenHasEnabledAdminGroup(token);
+        PsDereferenceImpersonationToken(token);
+        return admin; // low impersonation level denies; never fall back
+    }
+
+    token = PsReferencePrimaryToken(IoGetCurrentProcess());
+    if (token == NULL)
+        return FALSE; // lookup failure -> default deny
+    admin = skTokenHasEnabledAdminGroup(token);
+    PsDereferencePrimaryToken(token);
     return admin;
 }
 #endif
@@ -171,10 +223,15 @@ static SHINKEN_RUNDOWN g_HandleCreateRundown;
 //   drain and wait keeps the event signaled and the wait returns at once.
 //   Event set/wait pairs provide the release/acquire ordering for the stop
 //   flag and queue state; no lockless-volatile-only handoff.
-// Creators/destroy order: events + ReadyNotify in SkControlInit (events first,
-//   ReadyNotify may fire immediately); Quiesce sets stop -> signals stop event
-//   -> joins the thread -> only then purges the queue; SkControlDestroy
-//   (runtime-gated) deletes the device, which deletes the queue.
+// Creators/destroy order: events + ReadyNotify in SkControlInit (events
+// first, so an immediate registration-time fire finds a valid event); the
+// device is still unpublished at that point, so the queue is provably empty —
+// the drain-first consumer loop below makes even a theoretical pre-thread
+// arrival safe. The registration is unregistered never: it lives exactly as
+// long as the queue object (queue child of the device; deleted by
+// SkControlDestroy or the device-step rollback). Quiesce sets stop ->
+// signals stop event -> joins the thread -> only then purges the queue;
+// SkControlDestroy (runtime-gated) deletes the device, which deletes the queue.
 extern WDFQUEUE g_SkControlWdfQueue; // filled by device.c at queue creation
 static PVOID g_SkDequeueThread = NULL;
 static volatile LONG g_SkDequeueStop = 0;
@@ -802,28 +859,41 @@ NTSTATUS SkControlInit(PDRIVER_OBJECT driverObject) {
     UNREFERENCED_PARAMETER(driverObject);
     if (g_ControlReady)
         return STATUS_SUCCESS; // idempotent
-    // Control device is created exactly once by DriverEntry (device.c).
+    // Control device is created (unpublished) exactly once by DriverEntry
+    // (device.c); SkDevicePublish runs strictly after DriverEntry finishes
+    // SkLifecycleStart — i.e. after this function returned — so at every
+    // point below the queue is empty and no create can be in flight. That is
+    // what makes the rundown reset below safe: there is no concurrent
+    // Acquire whose count could be lost to a re-init.
     g_ControlReady = TRUE;
-    // Events BEFORE ReadyNotify: the callback may fire during registration.
+    // Events BEFORE ReadyNotify: the callback may fire during registration
+    // (pre-publish the queue is provably empty, but the ordering holds
+    // regardless).
     ShOps.EventInit(&g_SkDequeueDoorbell);
     ShOps.EventInit(&g_SkDequeueStopEvent);
     g_SkDequeueStop = 0;
     st = WdfIoQueueReadyNotify(g_SkControlWdfQueue, skIoctlEvtQueueReady, NULL);
     if (st != STATUS_SUCCESS) {
         g_ControlReady = FALSE;
-        return st;
+        return st; // registration never took effect; WDF has no unregister
+                   // API, but the queue object dies with the device on the
+                   // lifecycle device-step rollback (SK_STEP_DEVICE), which
+                   // is the registration's whole lifetime
     }
     // Consumer thread; without it the control plane is unusable -> init fails.
-    g_SkDequeueThread = NULL;
+    // The ReadyNotify registration from the successful branch above is owned
+    // the same way: released with the queue object during that rollback.
     st = ShOps.ThreadCreate(skDequeueThreadBody, NULL, &g_SkDequeueThread);
     if (st != STATUS_SUCCESS) {
-        g_SkDequeueThread = NULL;
+        g_SkDequeueThread = NULL; // contract: failure leaves no untracked thread
         g_ControlReady = FALSE;
-        return STATUS_INSUFFICIENT_RESOURCES;
+        return st; // surface the real failure status
     }
-    // Handle-create gate: fresh (re)init before the gate opens. The rundown
-    // lives in image-level static storage and is never freed (rundown.h
-    // invariant 9); stop is one-way, which matches the one-way teardown.
+    // Handle-create gate: fresh (re)init while the device is still
+    // unpublished (no create can have Acquired it) and before the gate opens.
+    // The rundown lives in image-level static storage and is never freed
+    // (rundown.h invariant 9); stop is one-way, which matches the one-way
+    // teardown.
     ShRundownInit(&g_HandleCreateRundown, "ControlHandleCreate");
     // Open the request gate only after the consumer exists (fenced create:
     // success means the startup decision is made; failure left no consumer).
@@ -835,6 +905,14 @@ NTSTATUS SkControlInit(PDRIVER_OBJECT driverObject) {
 BOOLEAN SkControlQuiesce(void) {
     ULONG i;
     NTSTATUS jst;
+    // Total over every control-plane state: if SkControlInit never completed,
+    // no request gate was opened, no consumer thread was created, no handle
+    // was ever counted (creates are impossible before SkDevicePublish, and
+    // publication requires a completed init) — nothing to quiesce. This also
+    // makes a post-destroy Quiesce a defined no-op instead of touching
+    // never-initialized/stopped-and-deleted objects.
+    if (!g_ControlReady)
+        return TRUE;
     // Order contract (P1 defect fix): close the request gate AND the
     // handle-create gate FIRST, then wait for FileCreates already inside the
     // gate, then drain everything else, then wait handles==0. Device destroy

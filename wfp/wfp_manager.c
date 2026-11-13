@@ -1,37 +1,14 @@
-// ============================================================================
-// wfp/wfp_manager.c — WFP manager (contract and ordering in wfp_manager.h)
-//
-// Install: installMutex (PASSIVE mutex) -> FwpmEngineOpen0 (DYNAMIC
-// session) -> engine transaction Begin -> provider add -> sublayer add ->
-// per-layer register/add/filter add -> Commit. Any failure: Abort
-// (return value checked: an unconfirmed abort is itself recorded) +
-// reverse-phase rollback. Rollback deletes every REGISTERED/ACTIVE
-// object and, for callouts, every runtime registration still on the
-// books (calloutRuntimeId != 0 — a failed FwpmCalloutAdd0 does NOT erase
-// the FwpsCalloutRegister1 fact); flow contexts are stripped with the
-// same busyCleanup as normal teardown (a FALSE strip parks the object as
-// LEAKED instead of retrying a BUSY that must fail). Unknown rollback
-// error => object LEAKED + block reason recorded; failure is returned
-// and the caller parks.
-//
-// Teardown (idempotent): per callout: attach gate Stop+Drain (no new
-// FwpsFlowAssociateContext0, in-flight attaches settled) -> strip and
-// settle flow contexts BEFORE the unregister safe point (the unregister
-// contract forfeits flowDeleteFn; PENDING removals are awaited bounded,
-// unknown errors retried; a layer that will not settle keeps its callout
-// registered and parks with ShinkenBlockFlowContextDrain) -> per-layer
-// unregister (busyCleanup still strips between BUSY retries) -> delete
-// filter/callout -> delete sublayer/provider -> close engine. Any
-// LEAKED/failure => ShRuntimeRecordBlock + FALSE (caller parks).
-// ============================================================================
+// Dynamic sessions own all engine objects. Runtime callouts are separate
+// registrations and survive BFE restarts. A successful session close removes
+// every terminating filter before any runtime registration is withdrawn.
+// Failure retains the handle/IDs and forbids unsafe cleanup or reset.
 #include <ntddk.h>
 #include "wfp_manager.h"
 #include "wfp_guids.h" // g_SkProviderKey/g_SkSubLayerKey single definition (test GUIDs)
-#include "../runtime/sk_atomic.h" // SkAtOr32 (one-time mutex init flag)
 #include "../packet/flow_context.h"
 
-#define SK_WFP_BUSY_RETRIES    8  // bounded BUSY retry limit for callout unregister
-#define SK_WFP_RETRY_DELAY_MS  10
+#define SK_WFP_BUSY_RETRIES 100
+#define SK_WFP_RETRY_DELAY_MS 10
 #ifndef FWPM_SESSION_FLAG_DYNAMIC
 #define FWPM_SESSION_FLAG_DYNAMIC 0x00000001u // session objects reclaimed on handle close
 #endif
@@ -41,10 +18,22 @@ SK_WFP_MANAGER g_WfpManager;
 // IRQL contract: all WFP calls and BUSY-retry sleeps in this file
 // require PASSIVE_LEVEL; a spin lock would raise IRQL to DISPATCH_LEVEL
 // and break FwpmEngineOpen0, so the install-path mutex must be a KMUTEX.
-static LONG g_WfpMutexReady; // BSS 0: not yet initialized
+static BOOLEAN g_WfpMutexReady;
 VOID SkWfpManagerInitMutex(void) {
-    if (SkAtOr32(&g_WfpMutexReady, 1) == 0)
-        KeInitializeMutex(&g_WfpManager.installMutex, 0);
+    UINT32 i;
+    // DriverEntry is the sole initializer, before callback publication.
+    if (g_WfpMutexReady)
+        return;
+    KeInitializeMutex(&g_WfpManager.installMutex, 0);
+    SkWfpObjectReset(&g_WfpManager.engineObj, "wfpEngine");
+    SkWfpObjectReset(&g_WfpManager.provider, "wfpProvider");
+    SkWfpObjectReset(&g_WfpManager.sublayer, "wfpSublayer");
+    for (i = 0; i < SK_LAYER_COUNT; i++) {
+        SkWfpObjectReset(&g_WfpManager.callouts[i], g_SkCalloutDefs[i].name);
+        SkWfpObjectReset(&g_WfpManager.filters[i], g_SkCalloutDefs[i].name);
+        g_WfpManager.callouts[i].key = *g_SkCalloutDefs[i].calloutKey;
+    }
+    g_WfpMutexReady = TRUE;
 }
 static VOID skWfpLock(void) {
     (VOID)KeWaitForSingleObject(&g_WfpManager.installMutex, Executive,
@@ -54,15 +43,10 @@ static VOID skWfpUnlock(void) {
     (VOID)KeReleaseMutex(&g_WfpManager.installMutex, FALSE);
 }
 
-// Pre-unregister flow strip for one layer (teardown and rollback). Runs
-// AFTER the attach gate drain, BEFORE FwpsCalloutUnregisterById0: the
-// unregister contract forfeits flowDeleteFn, so every context of this
-// callout must be confirmed removed now — SUCCESS/UNSUCCESSFUL return
-// their ref immediately, PENDING keeps it only until the promised async
-// flowDelete (waited for here, bounded), unknown errors are retried by
-// re-stripping. FALSE = contexts remain (PENDING not settled / strip
-// untrusted): the caller must NOT unregister the callout (it stays
-// registered so the promised callbacks can still fire) and must park.
+// Close/drain the attach gate before stripping flows. Contexts remain linked
+// until flowDeleteFn returns the table reference; strip holds only an actor
+// reference. Wait globally for callbacks, retrying unknown removal failures.
+// A surviving context forbids unregister so its callback remains reachable.
 static BOOLEAN skWfpStripCalloutFlows(UINT32 layerId) {
     UINT32 rtId = g_WfpManager.callouts[layerId].calloutRuntimeId;
     ULONG attempt;
@@ -82,169 +66,91 @@ static BOOLEAN skWfpStripCalloutFlows(UINT32 layerId) {
     }
 }
 
-// Between BUSY retries: strip all flow contexts of this callout (BUSY
-// root-cause handling). ctx = internal layer id (passed by teardown).
-// TRUE only when the strip is confirmed complete AND the table is empty;
-// FALSE keeps the caller in the BUSY loop / parks it as LEAKED, and a
-// residual flow count additionally records ShinkenBlockFlowContextDrain
-// (unload must stay blocked while any context remains associated).
-static BOOLEAN skWfpBusyCleanup(PVOID ctx) {
-    UINT32 layerId = (UINT32)(UINT64)ctx;
-    BOOLEAN clean;
-    if (layerId >= SK_LAYER_COUNT)
-        return TRUE; // nothing addressable: no strip evidence needed
-    clean = SkFlowRemoveAll(g_WfpManager.callouts[layerId].calloutRuntimeId);
-    if (SkFlowCount() != 0) {
-        ShRuntimeRecordBlock(ShinkenBlockFlowContextDrain);
-        return FALSE; // residual contexts: drain unconfirmed
-    }
-    return clean;
-}
-
-// Delete a by-key engine object (sublayer/provider) and classify the
-// error: SUCCESS / documented NOT_FOUND => DELETED; anything else =>
-// LEAKED. Returns whether removal was confirmed.
-static BOOLEAN skWfpDeleteByKey(SK_WFP_OBJECT *o, HANDLE engine, BOOLEAN isSubLayer) {
+// The only authority that discards engine-side identities is confirmed
+// closure of their owning dynamic session. Runtime IDs are never cleared here.
+static BOOLEAN skWfpCloseSessionLocked(void) {
+    UINT32 i;
     NTSTATUS st;
-    NTSTATUS notFound = isSubLayer ? FWP_E_SUBLAYER_NOT_FOUND : FWP_E_PROVIDER_NOT_FOUND;
-
-    if (o->state != SkWfpStateRegistered && o->state != SkWfpStateActive)
-        return TRUE; // not installed: nothing to do
-    if (isSubLayer)
-        st = ShOps.SubLayerDeleteByKey(engine, &g_SkSubLayerKey);
-    else
-        st = ShOps.ProviderDeleteByKey(engine, &g_SkProviderKey);
-    o->lastStatus = st;
-    if (st == STATUS_SUCCESS || st == notFound) {
-        o->state = SkWfpStateDeleted;
+    if (g_WfpManager.engine == NULL)
         return TRUE;
+    st = ShOps.EngineClose(g_WfpManager.engine);
+    g_WfpManager.engineObj.lastStatus = st;
+    if (st != STATUS_SUCCESS) {
+        g_WfpManager.engineObj.state = SkWfpStateLeaked;
+        ShRuntimeRecordBlock(ShinkenBlockEngineClose);
+        return FALSE;
     }
-    o->state = SkWfpStateLeaked; // unknown error: removal state untrusted
-    return FALSE;
+    g_WfpManager.engine = NULL;
+    g_WfpManager.installed = FALSE;
+    g_WfpManager.engineObj.state = SkWfpStateDeleted;
+    g_WfpManager.provider.state = SkWfpStateDeleted;
+    g_WfpManager.sublayer.state = SkWfpStateDeleted;
+    for (i = 0; i < SK_LAYER_COUNT; i++) {
+        SK_WFP_OBJECT *co = &g_WfpManager.callouts[i];
+        g_WfpManager.filters[i].filterId = 0;
+        g_WfpManager.filters[i].state = SkWfpStateDeleted;
+        co->calloutId = 0;
+        if (co->state != SkWfpStateLeaked)
+            co->state = co->calloutRuntimeId != 0 ?
+                SkWfpStateRegistered : SkWfpStateDeleted;
+    }
+    return TRUE;
 }
 
-// Reverse-order rollback (install failure path): delete every object that
-// is still on the books — per layer filter -> callout (runtime unregister
-// + mgmt delete) -> sublayer -> provider -> close engine. Rollback is
-// judged by the id facts, not by state alone: a failed FwpmCalloutAdd0
-// leaves the runtime registration (calloutRuntimeId != 0) held, and it
-// must be unregistered exactly once. Flow stripping uses the same
-// busyCleanup as normal teardown: an unconfirmed strip parks the callout
-// as LEAKED instead of retrying a BUSY that must fail.
-// Returns TRUE = all confirmed removed; FALSE = some LEAKED (caller parks).
-static BOOLEAN skWfpRollbackLocked(void) {
+static BOOLEAN skWfpBusyCleanup(PVOID ctx) {
+    return skWfpStripCalloutFlows((UINT32)(UINT64)ctx);
+}
+
+static BOOLEAN skWfpTeardownLocked(void) {
     BOOLEAN clean = TRUE;
     UINT32 i;
 
-    for (i = SK_LAYER_COUNT; i-- > 0;) {
+    // If close fails, filters may still invoke their callouts: retain both.
+    if (!skWfpCloseSessionLocked())
+        return FALSE;
+    for (i = 0; i < SK_LAYER_COUNT; i++) {
         SK_WFP_OBJECT *co = &g_WfpManager.callouts[i];
-        SK_WFP_OBJECT *fi = &g_WfpManager.filters[i];
-
-        if (fi->state == SkWfpStateRegistered || fi->state == SkWfpStateActive) {
-            SkWfpObjectDelete(fi, g_WfpManager.engine);
-            if (fi->state == SkWfpStateLeaked)
-                clean = FALSE;
+        if (co->calloutRuntimeId == 0)
+            continue;
+        if (!SkFlowGateStopAndDrain(i, SK_WFP_BUSY_RETRIES,
+                                    SK_WFP_RETRY_DELAY_MS) ||
+            !skWfpStripCalloutFlows(i)) {
+            ShRuntimeRecordBlock(ShinkenBlockFlowContextDrain);
+            clean = FALSE;
+            continue;
         }
-        // unregister whenever a runtime registration exists, regardless of
-        // state: AddCallout/AddFilter failure after a successful register
-        // keeps calloutRuntimeId set with state REGISTERED (never Failed-only).
-        // Same protocol as teardown: attach gate first, then strip + settle
-        // flow contexts, then the unregister safe point. A gate that fails
-        // to drain or a strip that will not settle keeps the callout
-        // REGISTERED and parks (clean = FALSE) rather than unregistering
-        // under a live callback surface.
-        if (co->state == SkWfpStateRegistered || co->state == SkWfpStateActive ||
-            co->calloutRuntimeId != 0) {
-            BOOLEAN mayUnregister = TRUE;
-            if (co->calloutRuntimeId != 0 &&
-                !SkFlowGateStopAndDrain(co->calloutRuntimeId, SK_WFP_BUSY_RETRIES,
-                                        SK_WFP_RETRY_DELAY_MS)) {
-                ShRuntimeRecordBlock(ShinkenBlockFlowContextDrain);
-                mayUnregister = FALSE;
-                clean = FALSE;
-            }
-            if (mayUnregister && !skWfpStripCalloutFlows(i)) {
-                mayUnregister = FALSE;
-                clean = FALSE;
-            }
-            if (mayUnregister) {
-                // kernel-side registration is outside the engine transaction; explicit unregister required
-                SkWfpObjectUnregister(co, (PVOID)(UINT64)i, skWfpBusyCleanup,
-                                      SK_WFP_BUSY_RETRIES, SK_WFP_RETRY_DELAY_MS);
-            }
-            if (co->state == SkWfpStateLeaked) {
-                clean = FALSE;
-            } else if (mayUnregister && co->calloutId != 0) {
-                SkWfpObjectDelete(co, g_WfpManager.engine);
-                if (co->state == SkWfpStateLeaked)
-                    clean = FALSE;
-            }
-        }
-    }
-    if (!skWfpDeleteByKey(&g_WfpManager.sublayer, g_WfpManager.engine, TRUE))
-        clean = FALSE;
-    if (!skWfpDeleteByKey(&g_WfpManager.provider, g_WfpManager.engine, FALSE))
-        clean = FALSE;
-    if (g_WfpManager.engine != NULL) {
-        NTSTATUS st = ShOps.EngineClose(g_WfpManager.engine);
-        g_WfpManager.engineObj.lastStatus = st;
-        if (st == STATUS_SUCCESS) {
-            // FwpmEngineClose0 has no documented "not-found" form: only SUCCESS confirms close
-            g_WfpManager.engineObj.state = SkWfpStateDeleted;
-            g_WfpManager.engine = NULL;
-        } else {
-            g_WfpManager.engineObj.state = SkWfpStateLeaked;
+        (VOID)SkWfpObjectUnregister(co, (PVOID)(UINT64)i, skWfpBusyCleanup,
+                                    SK_WFP_BUSY_RETRIES, SK_WFP_RETRY_DELAY_MS);
+        if (co->calloutRuntimeId != 0) {
+            ShRuntimeRecordBlock(ShinkenBlockSensorCalloutBusy);
             clean = FALSE;
         }
+    }
+    if (SkFlowCount() != 0) {
+        ShRuntimeRecordBlock(ShinkenBlockFlowContextDrain);
+        clean = FALSE;
     }
     return clean;
 }
 
-NTSTATUS SkWfpManagerInstall(PDEVICE_OBJECT device) {
+static NTSTATUS skWfpInstallLocked(PDEVICE_OBJECT device) {
     FWPM_SESSION0 session;
     NTSTATUS st;
     NTSTATUS stFail = STATUS_UNSUCCESSFUL;
     UINT32 i;
     BOOLEAN txnBegun = FALSE;
-    BOOLEAN clean = FALSE; // abort-unconfirmed flag (OR-ed into the rollback verdict)
 
-    skWfpLock();
-    if (g_WfpManager.installed) {
-        skWfpUnlock();
-        return STATUS_SUCCESS; // idempotent
-    }
-    // LEAKED guard (a BFE callback may re-run Install): a LEAKED object's
-    // engine-side identity is still registered but untrusted; Reset would
-    // orphan it (double registration/leak), so refuse reinstall and keep
-    // tracking. The caller keeps its deferred retry.
-    if (g_WfpManager.engineObj.state == SkWfpStateLeaked ||
-        g_WfpManager.provider.state == SkWfpStateLeaked ||
-        g_WfpManager.sublayer.state == SkWfpStateLeaked) {
-        skWfpUnlock();
+    if (g_WfpManager.installed)
+        return STATUS_SUCCESS;
+    // Never overwrite an unclosed session or an unconfirmed registration.
+    if (g_WfpManager.engine != NULL)
         return STATUS_DEVICE_BUSY;
-    }
     for (i = 0; i < SK_LAYER_COUNT; i++) {
-        if (g_WfpManager.callouts[i].state == SkWfpStateLeaked ||
-            g_WfpManager.filters[i].state == SkWfpStateLeaked) {
-            skWfpUnlock();
+        if (g_WfpManager.callouts[i].state == SkWfpStateLeaked)
             return STATUS_DEVICE_BUSY;
-        }
     }
 
-
-    SkWfpObjectReset(&g_WfpManager.engineObj, "wfpEngine");
-    SkWfpObjectReset(&g_WfpManager.provider, "wfpProvider");
-    SkWfpObjectReset(&g_WfpManager.sublayer, "wfpSublayer");
-    for (i = 0; i < SK_LAYER_COUNT; i++) {
-        SkWfpObjectReset(&g_WfpManager.callouts[i], g_SkCalloutDefs[i].name);
-        SkWfpObjectReset(&g_WfpManager.filters[i], g_SkCalloutDefs[i].name);
-        g_WfpManager.callouts[i].key = *g_SkCalloutDefs[i].calloutKey;
-    }
-    g_WfpManager.engine = NULL;
-
-    // Engine (DYNAMIC session: objects are reclaimed on handle close, but
-    // teardown still deletes explicitly — only explicit deletion gives
-    // confirmed-removal evidence).
+    // The session is the ownership boundary for all management objects.
     RtlZeroMemory(&session, sizeof(session));
     session.flags = FWPM_SESSION_FLAG_DYNAMIC;
     g_WfpManager.engineObj.phase = SkWfpPhaseEngineOpen;
@@ -303,7 +209,8 @@ NTSTATUS SkWfpManagerInstall(PDEVICE_OBJECT device) {
         }
         g_WfpManager.sublayer.state = SkWfpStateRegistered;
     }
-    // per layer: register (kernel-side, outside txn) -> add (engine) -> filter (activate)
+    // Reuse runtime registrations across BFE restarts; only engine objects
+    // belong to this transaction and need to be recreated.
     for (i = 0; i < SK_LAYER_COUNT; i++) {
         const SK_CALLOUT_DEF *def = &g_SkCalloutDefs[i];
         SK_WFP_OBJECT *co = &g_WfpManager.callouts[i];
@@ -318,14 +225,14 @@ NTSTATUS SkWfpManagerInstall(PDEVICE_OBJECT device) {
         c1.notifyFn = def->notifyFn;
         c1.flowDeleteFn = def->flowDeleteFn;
 
-        st = SkWfpObjectRegisterCallout(co, device, &c1);
-        if (!NT_SUCCESS(st)) {
-            stFail = st;
-            goto rollback;
+        if (co->calloutRuntimeId == 0) {
+            st = SkWfpObjectRegisterCallout(co, device, &c1);
+            if (!NT_SUCCESS(st)) {
+                stFail = st;
+                goto rollback;
+            }
+            SkFlowGateRearm(i, co->calloutRuntimeId);
         }
-        // the runtime id is fresh (or recycled): re-arm this callout's
-        // flow-attach gate so SkFlowAttach accepts new associations
-        SkFlowGateRearm(co->calloutRuntimeId);
         st = SkWfpObjectAddCallout(co, g_WfpManager.engine);
         if (!NT_SUCCESS(st)) {
             stFail = st;
@@ -345,133 +252,65 @@ NTSTATUS SkWfpManagerInstall(PDEVICE_OBJECT device) {
         goto rollback;
     }
     g_WfpManager.installed = TRUE;
-    skWfpUnlock();
     return STATUS_SUCCESS;
 
 rollback:
     if (txnBegun) {
-        // Abort's return value is checked: an unconfirmed abort leaves the
-        // transaction state untrusted, which is itself a rollback failure
-        // (objects may or may not exist). The id-based delete paths treat
-        // documented NOT_FOUND as confirmed-removed, so rollback still
-        // proceeds; only the overall clean verdict is affected.
         NTSTATUS stAbort = FwpmTransactionAbort0(g_WfpManager.engine);
-        if (stAbort != STATUS_SUCCESS) {
-            ShRuntimeRecordBlock(ShinkenBlockEngineClose);
-            g_WfpManager.engineObj.lastStatus = stAbort;
-            clean = FALSE; // skWfpRollbackLocked's own verdict is OR-ed below
-        }
+        // Even if abort fails, a successful close below ends the entire
+        // dynamic session and supplies definitive management cleanup proof.
+        g_WfpManager.engineObj.lastStatus = stAbort;
     }
-    if (!skWfpRollbackLocked() || !clean) {
-        // Rollback itself failed (LEAKED): record the reason; the caller
-        // (runtime/lifecycle.c) parks instead of allowing unload.
-        ShRuntimeRecordBlock(ShinkenBlockEngineClose);
-    }
+    if (!skWfpTeardownLocked())
+        ShRuntimeEnterUnloadBlocked(ShRuntimeBlockReason());
 out:
-    skWfpUnlock();
     return stFail;
 }
 
-BOOLEAN SkWfpManagerTeardown(void) {
-    UINT32 i;
-    BOOLEAN ok = TRUE;
-
+NTSTATUS SkWfpManagerInstall(PDEVICE_OBJECT device) {
+    NTSTATUS st = STATUS_SUCCESS;
     skWfpLock();
-    if (!g_WfpManager.installed && g_WfpManager.engine == NULL) {
+    if (ShRuntimeState() == ShinkenUnloadBlocked) {
         skWfpUnlock();
-        return TRUE; // idempotent: not installed or already torn down
+        return STATUS_DEVICE_BUSY;
     }
-
-    // 1) per-callout attach gate first: close the gate (no new
-    // FwpsFlowAssociateContext0 can start) and drain in-flight attaches
-    // BEFORE the unregister safe point. An undrained attach means the
-    // callout must NOT be unregistered (a late associate would race the
-    // disappearing callout): record the block, mark the teardown failed
-    // (engine handle retained) and skip that layer's unregister.
-    {
-        BOOLEAN gateOk[SK_LAYER_COUNT];
-        for (i = 0; i < SK_LAYER_COUNT; i++) {
-            UINT32 rtId = g_WfpManager.callouts[i].calloutRuntimeId;
-            gateOk[i] = TRUE;
-            if (rtId != 0 &&
-                !SkFlowGateStopAndDrain(rtId, SK_WFP_BUSY_RETRIES, SK_WFP_RETRY_DELAY_MS)) {
-                ShRuntimeRecordBlock(ShinkenBlockFlowContextDrain);
-                gateOk[i] = FALSE;
-                ok = FALSE;
-            }
-        }
-        // 2) per-layer: strip + settle flow contexts BEFORE the unregister
-        // safe point (the unregister contract forfeits flowDeleteFn), then
-        // unregister (documented safe point; busyCleanup still strips
-        // between BUSY retries as a backstop)
-        for (i = 0; i < SK_LAYER_COUNT; i++) {
-            SK_WFP_OBJECT *co = &g_WfpManager.callouts[i];
-            if (!gateOk[i])
-                continue; // attach gate undrained: unregister unsafe for this layer
-            if (co->state == SkWfpStateActive || co->state == SkWfpStateRegistered) {
-                if (!skWfpStripCalloutFlows(i)) {
-                    ok = FALSE; // flows remain: callout kept registered (park)
-                    continue;
-                }
-                SkWfpObjectUnregister(co, (PVOID)(UINT64)i, skWfpBusyCleanup,
-                                      SK_WFP_BUSY_RETRIES, SK_WFP_RETRY_DELAY_MS);
-                if (co->state == SkWfpStateLeaked) {
-                    ShRuntimeRecordBlock(ShinkenBlockSensorCalloutBusy);
-                    ok = FALSE;
-                }
-            }
-        }
-    }
-    // Residual flow contexts (unknown RemoveContext errors kept resident by
-    // SkFlowRemoveAll, or an unconfirmed strip) must block unload: WFP may
-    // still hold flowContext pointers into this image.
-    if (SkFlowCount() != 0) {
-        ShRuntimeRecordBlock(ShinkenBlockFlowContextDrain);
-        ok = FALSE;
-    }
-    // 3) delete filter / engine-side callout (only parts actually installed)
-    for (i = 0; i < SK_LAYER_COUNT; i++) {
-        SK_WFP_OBJECT *fi = &g_WfpManager.filters[i];
-        SK_WFP_OBJECT *co = &g_WfpManager.callouts[i];
-        if (fi->filterId != 0) {
-            SkWfpObjectDelete(fi, g_WfpManager.engine);
-            if (fi->state == SkWfpStateLeaked) {
-                ShRuntimeRecordBlock(ShinkenBlockEngineClose);
-                ok = FALSE;
-            }
-        }
-        if (co->calloutId != 0 && co->state != SkWfpStateLeaked) {
-            SkWfpObjectDelete(co, g_WfpManager.engine);
-            if (co->state == SkWfpStateLeaked) {
-                ShRuntimeRecordBlock(ShinkenBlockEngineClose);
-                ok = FALSE;
-            }
-        }
-    }
-    // 4) sublayer / provider
-    if (!skWfpDeleteByKey(&g_WfpManager.sublayer, g_WfpManager.engine, TRUE)) {
-        ShRuntimeRecordBlock(ShinkenBlockEngineClose);
-        ok = FALSE;
-    }
-    if (!skWfpDeleteByKey(&g_WfpManager.provider, g_WfpManager.engine, FALSE)) {
-        ShRuntimeRecordBlock(ShinkenBlockEngineClose);
-        ok = FALSE;
-    }
-    // 5) close engine (handle retained while LEAKED objects remain — part of the park condition)
-    if (g_WfpManager.engine != NULL && ok) {
-        NTSTATUS st = ShOps.EngineClose(g_WfpManager.engine);
-        g_WfpManager.engineObj.lastStatus = st;
-        if (st == STATUS_SUCCESS) {
-            g_WfpManager.engineObj.state = SkWfpStateDeleted;
-            g_WfpManager.engine = NULL;
-        } else {
-            g_WfpManager.engineObj.state = SkWfpStateLeaked;
-            ShRuntimeRecordBlock(ShinkenBlockEngineClose);
-            ok = FALSE;
-        }
-    }
-    if (ok)
-        g_WfpManager.installed = FALSE;
+    if (FwpmBfeStateGet0() == FWPM_SERVICE_RUNNING)
+        st = skWfpInstallLocked(device);
     skWfpUnlock();
-    return ok;
+    return st;
+}
+
+NTSTATUS SkWfpManagerBfeStateChange(PDEVICE_OBJECT device, FWPM_SERVICE_STATE state) {
+    NTSTATUS st = STATUS_SUCCESS;
+    skWfpLock();
+    if (ShRuntimeState() == ShinkenUnloadBlocked) {
+        skWfpUnlock();
+        return STATUS_DEVICE_BUSY;
+    }
+    if (state == FWPM_SERVICE_STOP_PENDING || state == FWPM_SERVICE_STOPPED) {
+        // STOP_PENDING is delivered while the service can still close the
+        // session. Leave runtime registrations and existing flow contexts
+        // intact; their callbacks remain valid until final driver teardown.
+        g_WfpManager.installed = FALSE;
+        if (!skWfpCloseSessionLocked())
+            st = g_WfpManager.engineObj.lastStatus;
+    } else if (state == FWPM_SERVICE_RUNNING &&
+               FwpmBfeStateGet0() == FWPM_SERVICE_RUNNING) {
+        // A previous close failure must be resolved before a new handle is
+        // opened. No reset, fake NOT_FOUND, or orphaned session is allowed.
+        if (!g_WfpManager.installed && !skWfpCloseSessionLocked())
+            st = g_WfpManager.engineObj.lastStatus;
+        else
+            st = skWfpInstallLocked(device);
+    }
+    skWfpUnlock();
+    return st;
+}
+
+BOOLEAN SkWfpManagerTeardown(void) {
+    BOOLEAN clean;
+    skWfpLock();
+    clean = skWfpTeardownLocked();
+    skWfpUnlock();
+    return clean;
 }

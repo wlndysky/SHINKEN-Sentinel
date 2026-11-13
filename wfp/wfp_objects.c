@@ -6,7 +6,7 @@
 //   * create phase (register/add) failure => FAILED (object not on the
 //     books; may be rebuilt directly);
 //   * teardown (unregister/delete): only STATUS_SUCCESS or a documented
-//     FWP_E_*_NOT_FOUND => DELETED; STATUS_DEVICE_BUSY => bounded retry
+//     STATUS_FWP_*_NOT_FOUND => DELETED; STATUS_DEVICE_BUSY => bounded retry
 //     (each unregister round first runs busyCleanup to strip flow
 //     contexts); anything else => LEAKED (terminal: removal state
 //     untrusted; id/key/lastStatus kept; the upper layer records the
@@ -112,15 +112,9 @@ NTSTATUS SkWfpObjectAddCallout(SK_WFP_OBJECT *o, HANDLE engine) {
 // filterId set + REGISTERED (arbitration callbacks active); failure =>
 // FAILED.
 //
-// FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT is declared so that at run time
-// FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT reaches the matched FWPS_FILTER1
-// and a PERMIT written by this callout is final (packet/classify.c
-// clears FWPS_RIGHT_ACTION_WRITE on PERMIT only when the filter carries
-// that flag; without it the write right must survive for lower-priority
-// sublayers).
-#ifndef FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
-#define FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT 0x00000008u // fwpmk.h
-#endif
+// A permit is deliberately soft: other providers (including Windows
+// Firewall) must retain the ability to block at their own sublayers.
+// Our explicit BLOCK consumes the right in the classify callback.
 NTSTATUS SkWfpObjectAddFilter(SK_WFP_OBJECT *o, HANDLE engine,
                               const GUID *layerKey, UINT32 layerId) {
     FWPM_FILTER0 f;
@@ -135,12 +129,13 @@ NTSTATUS SkWfpObjectAddFilter(SK_WFP_OBJECT *o, HANDLE engine,
     }
     RtlZeroMemory(&f, sizeof(f));
     f.displayData.name = SK_WFP_FILTER_NAME_W; // BFE requires non-empty (as above)
-    f.flags = FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT;
+    f.flags = 0;
     f.filterKey = *def->filterKey;  // explicit key (wfp_guids.h): diagnosable / verifiable by key
     f.layerKey = *layerKey;
-    // Explicit high weight: FWP_EMPTY auto-weight is too low and a
-    // higher-weight terminating filter would win arbitration (BLOCK
-    // computed but not enforced). Weight = 2^48.
+    f.subLayerKey = g_SkSubLayerKey;
+    f.providerKey = (GUID *)&g_SkProviderKey;
+    // Explicit intra-sublayer weight: 2^48 - 1. Cross-sublayer arbitration
+    // still applies; a numeric weight is not an enforcement guarantee.
     f.weight.type = FWP_UINT64;
     f.weight.uint64 = (UINT64 *)&g_SkFilterWeight;
     f.numFilterConditions = 0;      // no conditions: match all
@@ -159,10 +154,9 @@ NTSTATUS SkWfpObjectAddFilter(SK_WFP_OBJECT *o, HANDLE engine,
     return st;
 }
 
-// FwpsCalloutUnregisterById0 with bounded BUSY retries (same discipline
-// as ShWfpUnregisterCalloutById): after a successful return, WFP
-// guarantees classifyFn/notifyFn/flowDeleteFn are no longer called
-// (documented safe point).
+// Runtime unregister is independent of the engine session. A nonzero
+// runtime ID always carries an unregister obligation, even after the
+// corresponding management object or dynamic session has disappeared.
 //
 // Runtime-registration fact vs object state: the unregister obligation is
 // judged by calloutRuntimeId, not by state — a create-phase failure of a
@@ -184,16 +178,15 @@ NTSTATUS SkWfpObjectUnregister(SK_WFP_OBJECT *o, PVOID busyCtx,
     NTSTATUS st;
     ULONG attempt;
 
-    if (o->calloutRuntimeId == 0 || o->state == SkWfpStateDeleted ||
-        o->state == SkWfpStateUninitialized)
-        return STATUS_SUCCESS; // idempotent: no runtime registration on the books
+    if (o->calloutRuntimeId == 0)
+        return STATUS_SUCCESS;
     if (o->state == SkWfpStateLeaked)
         return STATUS_DEVICE_BUSY; // terminal state: never touch again
     o->state = SkWfpStateQuiescing;
     for (attempt = 0;; attempt++) {
         st = ShOps.UnregisterCalloutById(o->calloutRuntimeId);
         o->lastStatus = st;
-        if (st == STATUS_SUCCESS || st == FWP_E_CALLOUT_NOT_FOUND) {
+        if (st == STATUS_SUCCESS || st == STATUS_FWP_CALLOUT_NOT_FOUND) {
             // NOT_FOUND = documented "not registered", equivalent to success: confirmed removed
             o->calloutRuntimeId = 0; // confirmed: the unregister obligation is spent
             o->state = SkWfpStateDeleted;
@@ -221,39 +214,3 @@ NTSTATUS SkWfpObjectUnregister(SK_WFP_OBJECT *o, PVOID busyCtx,
     }
 }
 
-// Delete engine objects by installed part (filter before callout; only
-// parts actually installed). Same error classification as unregister:
-// SUCCESS / FWP_E_*_NOT_FOUND => DELETED; anything else => LEAKED.
-// Note: state DELETED is not an early-out — a callout object carries
-// both a runtime registration (unregister sets DELETED) and an
-// engine-side mgmt callout (calloutId may still be set). Idempotence
-// is judged by whether the id fields are zeroed, not by state.
-NTSTATUS SkWfpObjectDelete(SK_WFP_OBJECT *o, HANDLE engine) {
-    NTSTATUS st;
-
-    if (o->state == SkWfpStateLeaked)
-        return STATUS_DEVICE_BUSY;
-    if (o->filterId != 0) {
-        st = ShOps.FilterDeleteById(engine, o->filterId);
-        o->lastStatus = st;
-        if (st == STATUS_SUCCESS || st == FWP_E_FILTER_NOT_FOUND) {
-            o->filterId = 0;
-            o->state = SkWfpStateDeleted;
-            return st;
-        }
-        o->state = SkWfpStateLeaked;
-        return st;
-    }
-    if (o->calloutId != 0) {
-        st = ShOps.CalloutDeleteById(engine, o->calloutId);
-        o->lastStatus = st;
-        if (st == STATUS_SUCCESS || st == FWP_E_CALLOUT_NOT_FOUND) {
-            o->calloutId = 0;
-            o->state = SkWfpStateDeleted;
-            return st;
-        }
-        o->state = SkWfpStateLeaked;
-        return st;
-    }
-    return STATUS_SUCCESS; // no parts installed: nothing to do
-}

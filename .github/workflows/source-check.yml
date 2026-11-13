@@ -1,0 +1,49 @@
+name: Source checks (no driver build)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shim-syntax:
+    name: Windows x64 shim syntax
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check all source modules without emitting code
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $clang = Join-Path $env:ProgramFiles 'LLVM\bin\clang.exe'
+          if (!(Test-Path $clang)) {
+            throw 'The runner does not provide clang.exe.'
+          }
+          & $clang --version
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot run clang.exe.' }
+
+          # Keep the shim flags and module inventory owned by build.bat.
+          # Do not execute build.bat: this job emits no objects, IR, or driver.
+          $build = Get-Content build.bat
+          $flagLine = @($build | Where-Object { $_ -match '^set FLAGS=' })
+          $moduleLine = @($build | Where-Object { $_ -match '^set MODULES=' })
+          if ($flagLine.Count -ne 1 -or $moduleLine.Count -ne 1) {
+            throw 'Expected one FLAGS and one MODULES assignment in build.bat.'
+          }
+          $flags = $flagLine[0].Substring('set FLAGS='.Length) -split '\s+'
+          $modules = $moduleLine[0].Substring('set MODULES='.Length) -split '\s+'
+          foreach ($module in $modules) {
+            Write-Host "[syntax] $module"
+            & $clang @flags -fsyntax-only $module
+            if ($LASTEXITCODE -ne 0) {
+              throw "Syntax check failed: $module"
+            }
+          }
+          "Checked $($modules.Count) modules with clang -fsyntax-only. No WDK/MSBuild, linking, driver packaging, installation, or loading was performed." | Add-Content $env:GITHUB_STEP_SUMMARY

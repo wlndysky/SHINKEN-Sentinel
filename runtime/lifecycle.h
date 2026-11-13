@@ -1,19 +1,11 @@
-// ============================================================================
-// runtime/lifecycle.h — 子系统生命周期编排(严格顺序)
-//
-// quiesce 顺序(失败即 FALSE, 由 runtime 驻留):
-//   1. 关闭 IOCTL 新请求门(control/ioctl.c)
-//   2. 关闭规则写入门(rules/rule_store.c)
-//   3. 关闭遥测生产者门(telemetry/event_queue.c)
-//   4. 关闭注入门(packet/injection.c, ShInjectionGateStop)
-//   5. 退订 BFE + drain BFE 回调 rundown
-//   6. 注销全部 callout(WFP 文档化安全点; BUSY 重试间摘 flow context)
-//   7. drain classify/注入/work item rundown
-//   8. 停/join 事件线程
-// destroy 顺序(quiescent 后): 删 filter/callout/sublayer/provider →
-//   销毁注入句柄 → 销毁池 → 关引擎 → 释放规则快照 → 删队列/设备。
-// 幂等: 重复 quiesce/destroy 安全; init 部分失败回滚走同一对函数。
-// ============================================================================
+// Lifecycle orchestration, PASSIVE_LEVEL only.
+// Startup builds private subsystems before BFE subscription and publishes
+// the device last. Shutdown closes control/telemetry/injection producers,
+// unsubscribes and drains BFE callbacks, closes the dynamic WFP session,
+// drains flow contexts, then unregisters runtime callouts. Only confirmed
+// quiescence permits pool, rule snapshot, and device destruction.
+// Failed startup follows the same ownership rules; rollback never discards
+// an unconfirmed registration or returns an unloadable failure state.
 #pragma once
 #include <ntddk.h>
 

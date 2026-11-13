@@ -12,9 +12,8 @@
 // classifyOut write is gated on the right). Finality contract: BLOCK
 // always clears the WRITE bit (a veto consumes the right). PERMIT clears
 // the WRITE bit ONLY when the matched filter carries
-// FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT (driver filters are added with
-// FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT); with the flag unset the bit
-// survives so lower-priority sublayers can still arbitrate — the
+// FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT. Our filters leave this flag unset,
+// so other providers may still block a permitted connection. The
 // verdict computed here is an internal decision, not a guarantee that
 // Windows enforces it. BLOCK only on ALE_AUTH_* (hardBlockAllowed=1);
 // FLOW_ESTABLISHED always PERMITs (never forced BLOCK; flow context

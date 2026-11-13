@@ -13,12 +13,16 @@ extern "C" {
 // `counted` is set ONLY after the handle-create gate (ShRundown, see ioctl.c)
 // accepted the create; EvtFileDestroy pairs ShHandleClose exactly when counted.
 typedef struct _SK_IOCTL_CONTEXT {
-    BOOLEAN privileged;   // handle-scoped capability: LocalSystem/Administrators, decided at create
+    BOOLEAN privileged;   // handle-scoped capability: enabled BUILTIN\Administrators
+                          // group of the creator's EFFECTIVE token (impersonation- and
+                          // UAC deny-only aware; see ioctl.c), decided once at create
     BOOLEAN counted;      // ShHandleOpen paired (destroy decrements on this)
 } SK_IOCTL_CONTEXT;
 
 // Control-plane lifecycle
-NTSTATUS SkControlInit(PDRIVER_OBJECT driverObject);  // build control device/queue/ACL
+NTSTATUS SkControlInit(PDRIVER_OBJECT driverObject);  // start control-plane consumers: ReadyNotify +
+                                                      // dequeue thread + create-rundown reset + request
+                                                      // gate (device/queue/ACL live in driver/device.c)
 BOOLEAN SkControlQuiesce(void);                       // close request + handle-create gates (ShRundown),
                                                       // drain in-flight creates, join consumer,
                                                       // bounded-wait handles==0; TRUE => destroy allowed

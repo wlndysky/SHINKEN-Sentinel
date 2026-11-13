@@ -19,6 +19,17 @@
 //   Rollback slot: the displaced snapshot is kept (same reference protocol;
 //     content immutable; drained readers then copied and republished) to
 //     support ROLLBACK to the previous version.
+//   RATE_LIMIT buckets: one reference-counted non-paged SK_RATE_BUCKET per
+//   RATE_LIMIT rule, allocated only by the writer while building the next
+//   snapshot (the classify path never allocates); allocation failure aborts
+//   the publish — the old policy stays in effect, there is no data-plane
+//   fail-open. A published snapshot owns one reference per non-NULL
+//   buckets[i]; reclaim releases them and frees the object at refcount zero.
+//   Equal id/rate/interval/burst shares a bucket for enabled rules. A
+//   burst-only change copies and clamps the state into a separate bucket;
+//   other parameter changes and disables start full. Copying occurs during
+//   snapshot building: overlapping policy versions finish independently.
+//   No failed publish changes the current bucket's tokens or refill clock.
 // ============================================================================
 #pragma once
 #include <ntddk.h>
@@ -29,8 +40,26 @@
 extern "C" {
 #endif
 
+// Per-RATE_LIMIT-rule token bucket (classify-time refill/consume math and
+// locking in rule_engine.c; allocation and refcount ownership in
+// rule_store.c). In a snapshot, buckets[i] is non-NULL iff rules[i].action
+// == SkRuleActionRateLimit — enabled or not: a disabled rule carries a
+// never-consumed full bucket, so a later re-enable cannot inherit stale
+// tokens (the documented disable-clears-bucket semantics).
+typedef struct _SK_RATE_BUCKET {
+    EX_SPIN_LOCK lock;    // protects mutable state; <= DISPATCH_LEVEL
+    UINT64 tokens;        // current token count (<= owning rule's burst)
+    UINT64 lastRefillMs;  // QPC ms baseline, valid once started
+    BOOLEAN started;     // first consumption anchors the refill interval
+    LONG refs;            // owning snapshots; writer path only, plain
+                          // counter — every transition is storeLock-serialized
+} SK_RATE_BUCKET;
+
+
 typedef struct _SK_RULE_SNAPSHOT {
     SK_RULE *rules;          // non-paged array (count entries, verdict-sorted)
+    SK_RATE_BUCKET **buckets; // parallel to rules; [i] != NULL iff rules[i]
+                              // is RATE_LIMIT (SK_RATE_BUCKET contract above)
     UINT32 count;
     UINT64 version;          // publish version (monotonic)
     UINT32 defaultPolicy;    // SkVerdictPermit / SkVerdictBlock

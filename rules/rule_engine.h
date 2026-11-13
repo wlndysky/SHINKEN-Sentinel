@@ -3,7 +3,8 @@
 // Verdict semantics (precedence pinned in rule_types.h):
 //   scan the snapshot (pre-sorted by priority desc + action strength +
 //   ruleId); the first fully matching enabled rule is the verdict; RATE_LIMIT
-//   consults the token bucket (mutable state outside the snapshot); no match
+//   consults the rule's per-snapshot bucket object (rule_store.h; shared
+//   across publishes for unchanged rules, never allocated here); no match
 //   => snapshot defaultPolicy. Timing stats: QPC deltas (exposed via
 //   GET_STATS).
 // ============================================================================
@@ -23,11 +24,6 @@ VOID SkRuleEvaluate(const SK_RULE_SNAPSHOT *snap, const SK_CLASSIFY_TUPLE *tuple
 // Statistics (classify updates; GET_STATS reads)
 extern SK_RULE_STATS g_SkRuleStats;
 VOID SkRuleStatsReset(void);
-
-// RATE_LIMIT state (one entry per rule id; snapshot-independent, lazily
-// cleaned when the rule is removed; auto-reset on rate-parameter change)
-VOID SkRuleRateReset(UINT64 ruleId);        // call on rule delete/disable
-VOID SkRuleRateClampBurst(UINT64 ruleId, UINT32 newBurst); // call on burst shrink
 
 #ifdef __cplusplus
 }

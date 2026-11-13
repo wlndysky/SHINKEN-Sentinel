@@ -109,7 +109,6 @@ NTSTATUS SkWfpObjectAddFilter(SK_WFP_OBJECT *o, HANDLE engine,
 NTSTATUS SkWfpObjectUnregister(SK_WFP_OBJECT *o, PVOID busyCtx,
                                BOOLEAN (*busyCleanup)(PVOID), ULONG maxBusyRetries,
                                ULONG delayMs);
-NTSTATUS SkWfpObjectDelete(SK_WFP_OBJECT *o, HANDLE engine); // delete by installed part
 
 #ifdef __cplusplus
 }

@@ -14,8 +14,8 @@
 #include "runtime.h"
 
 // ---------------------------------------------------------------------------
-static SHINKEN_RUNTIME_STATE g_State = ShinkenUninitialized;
-static SHINKEN_BLOCK_REASON g_BlockReason = ShinkenBlockNone; // first cause (kept, idempotent)
+static volatile LONG g_State = ShinkenUninitialized;
+static volatile LONG g_BlockReason = ShinkenBlockNone;
 // Full block-reason history (including later causes): residency is never an
 // unexplained hang — a debugger can inspect g_BlockHistory/g_BlockHistoryCount;
 // each record also triggers one Diag.
@@ -26,8 +26,6 @@ static SHINKEN_RUNDOWN g_InjectionRundown; // in-flight injection gate (see .h p
 static volatile LONG64 g_HandlesOpen = 0;  // per-handle context count
 
 SHINKEN_RUNDOWN ShRundownBfe;
-SHINKEN_RUNDOWN ShRundownWorkItem;
-SHINKEN_TEST_HOOK *ShTestHook;
 
 static const char *const g_StateNames[] = {"Uninitialized", "Active", "Teardown", "Quiescent",
                                            "UNLOAD_BLOCKED"};
@@ -53,35 +51,12 @@ static const char *const g_ReasonNames[] = {
 // the whole ShOps table externally)
 #ifndef SHINKEN_HOST_TEST
 static NTSTATUS shkUnregById(UINT32 id) { return FwpsCalloutUnregisterById0(id); }
-static NTSTATUS shkUnregByKey(const GUID *key) { return FwpsCalloutUnregisterByKey0(key); }
-static NTSTATUS shkFilterDelById(HANDLE engine, UINT64 filterId) {
-    return FwpmFilterDeleteById0(engine, filterId);
-}
-static NTSTATUS shkFilterDelByKey(HANDLE engine, const GUID *key) {
-    return FwpmFilterDeleteByKey0(engine, key);
-}
-static NTSTATUS shkCalloutDelById(HANDLE engine, UINT32 id) {
-    return FwpmCalloutDeleteById0(engine, id);
-}
-static NTSTATUS shkCalloutDelByKey(HANDLE engine, const GUID *key) {
-    return FwpmCalloutDeleteByKey0(engine, key);
-}
-static NTSTATUS shkProviderDelByKey(HANDLE engine, const GUID *key) {
-    return FwpmProviderDeleteByKey0(engine, key);
-}
-static NTSTATUS shkSubLayerDelByKey(HANDLE engine, const GUID *key) {
-    return FwpmSubLayerDeleteByKey0(engine, key);
-}
 static NTSTATUS shkEngineClose(HANDLE engine) { return FwpmEngineClose0(engine); }
 static NTSTATUS shkInjectionDestroy(HANDLE h) { return FwpsInjectionHandleDestroy0(h); }
 static NTSTATUS shkFlowRemoveContext(UINT64 flowId, UINT16 layerId, UINT32 calloutId) {
     return FwpsFlowRemoveContext0(flowId, layerId, calloutId);
 }
 static NTSTATUS shkBfeUnsubscribe(HANDLE h) { return FwpmBfeStateUnsubscribeChanges0(h); }
-static NTSTATUS shkWorkItemFlush(PVOID item) {
-    WdfWorkItemFlush(item); // synchronous: waits for the work item routine to return
-    return STATUS_SUCCESS;
-}
 static PVOID shkAllocPool(ULONG size, ULONG tag) {
 #ifndef SHINKEN_HOST_SHIM
     return ExAllocatePool2(POOL_FLAG_NON_PAGED, size, tag); // WDK-recommended form
@@ -97,7 +72,8 @@ static NTSTATUS shkThreadCreate(SHINKEN_THREAD_FN body, PVOID ctx, PVOID *outThr
 }
 static NTSTATUS shkThreadJoin(PVOID threadObject) {
     NTSTATUS st = KeWaitForSingleObject(threadObject, Executive, KernelMode, FALSE, NULL);
-    ObfDereferenceObject(threadObject);
+    if (st == STATUS_SUCCESS)
+        ObfDereferenceObject(threadObject);
     return st;
 }
 static VOID shkEventInit(SHINKEN_EVENT *ev) {
@@ -135,16 +111,14 @@ static VOID shkSleepMs(ULONG ms) {
     to.QuadPart = -(LONGLONG)ms * 10000;
     KeDelayExecutionThread(KernelMode, FALSE, &to);
 }
-static VOID shkDiag(const char *msg) { DbgPrint(msg); }
+static VOID shkDiag(const char *msg) { DbgPrint("%s\n", msg); }
 
 SHINKEN_OPS ShOps = {
-    shkUnregById,        shkUnregByKey,        shkFilterDelById,     shkFilterDelByKey,
-    shkCalloutDelById,   shkCalloutDelByKey,   shkProviderDelByKey,  shkSubLayerDelByKey,
-    shkEngineClose,      shkInjectionDestroy,  shkFlowRemoveContext, shkBfeUnsubscribe,
-    shkWorkItemFlush,    shkAllocPool,         shkFreePool,          shkThreadCreate,
-    shkThreadJoin,       shkEventInit,         shkEventSet,          shkEventWait,
-    shkEventWaitAny,
-    shkLockAcquire,      shkLockRelease,       shkSleepMs,           shkDiag,
+    shkUnregById,        shkEngineClose,       shkInjectionDestroy,
+    shkFlowRemoveContext, shkBfeUnsubscribe,   shkAllocPool,          shkFreePool,
+    shkThreadCreate,     shkThreadJoin,        shkEventInit,          shkEventSet,
+    shkEventWait,        shkEventWaitAny,      shkLockAcquire,        shkLockRelease,
+    shkSleepMs,          shkDiag,
 };
 #endif // !SHINKEN_HOST_TEST
 
@@ -202,6 +176,7 @@ static VOID shkThreadFenceWrapper(PVOID ctx) {
     ExFreePoolWithTag(sc, SHINKEN_THREAD_STARTUP_TAG); // thread-side free, every path
     if (wait == STATUS_WAIT_0) // startup index only; abort or wait error exits silently
         body(bodyCtx);
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 NTSTATUS ShThreadCreateFenced(SHINKEN_THREAD_FN body, PVOID ctx, PVOID *outThreadObject) {
@@ -253,24 +228,22 @@ NTSTATUS ShThreadCreateFenced(SHINKEN_THREAD_FN body, PVOID ctx, PVOID *outThrea
 // state machine
 // ---------------------------------------------------------------------------
 VOID ShRuntimeInit(void) {
-    if (g_State == ShinkenUninitialized) {
-        g_BlockReason = ShinkenBlockNone;
-        g_BlockHistoryCount = 0;
-        ShRundownInit(&ShRundownBfe, "BfeCallback");
-        ShRundownInit(&ShRundownWorkItem, "IoWorkItem");
-        ShRundownInit(&g_InjectionRundown, "Injection");
-    }
+    // DriverEntry calls this exactly once, before any callback is reachable.
+    ShRundownInit(&ShRundownBfe, "BfeCallback");
+    ShRundownInit(&g_InjectionRundown, "Injection");
 }
 
 VOID ShRuntimeActivate(void) {
-    ShRuntimeInit();
-    if (g_State == ShinkenUninitialized)
-        g_State = ShinkenActive;
-    // Re-activating after Teardown/terminal is a programming error: keep state (diagnostically visible)
+    // Never reinitialize rundowns here: BFE callbacks may already hold refs.
+    (VOID)SkAtCas32(&g_State, ShinkenActive, ShinkenUninitialized);
 }
 
-SHINKEN_RUNTIME_STATE ShRuntimeState(void) { return g_State; }
-SHINKEN_BLOCK_REASON ShRuntimeBlockReason(void) { return g_BlockReason; }
+SHINKEN_RUNTIME_STATE ShRuntimeState(void) {
+    return (SHINKEN_RUNTIME_STATE)SkAtOr32(&g_State, 0);
+}
+SHINKEN_BLOCK_REASON ShRuntimeBlockReason(void) {
+    return (SHINKEN_BLOCK_REASON)SkAtOr32(&g_BlockReason, 0);
+}
 
 const char *ShRuntimeStateName(SHINKEN_RUNTIME_STATE st) {
     return g_StateNames[(unsigned)st % 5];
@@ -279,60 +252,50 @@ const char *ShRuntimeBlockReasonName(SHINKEN_BLOCK_REASON why) {
     return g_ReasonNames[(unsigned)why % 14];
 }
 
-BOOLEAN ShRuntimeIsActive(void) { return g_State == ShinkenActive; }
+BOOLEAN ShRuntimeIsActive(void) { return ShRuntimeState() == ShinkenActive; }
 
 BOOLEAN ShRuntimeDestroyAllowed(void) {
-    return g_State == ShinkenQuiescent || g_State == ShinkenUninitialized;
+    SHINKEN_RUNTIME_STATE state = ShRuntimeState();
+    return state == ShinkenQuiescent || state == ShinkenUninitialized;
 }
 
 BOOLEAN ShRuntimeBeginTeardown(void) {
-    if (g_State == ShinkenTeardown)
-        return TRUE; // idempotent
-    if (g_State != ShinkenActive)
-        return g_State == ShinkenUninitialized; // never activated: nothing to drain
-    g_State = ShinkenTeardown;
-    return TRUE;
+    LONG previous = SkAtCas32(&g_State, ShinkenTeardown, ShinkenActive);
+    return previous == ShinkenActive || previous == ShinkenTeardown ||
+           previous == ShinkenUninitialized;
 }
 
 VOID ShRuntimeRecordBlock(SHINKEN_BLOCK_REASON why) {
     LONG idx = SkAtAdd32(&g_BlockHistoryCount, 1);
-    if (idx < SHINKEN_BLOCK_HISTORY_CAP)
-        g_BlockHistory[idx] = why; // later causes also kept in order (beyond capacity: counted only)
-    if (g_BlockReason == ShinkenBlockNone)
-        g_BlockReason = why; // keep first cause
+    if ((ULONG)idx < SHINKEN_BLOCK_HISTORY_CAP)
+        SkAtXchg32((volatile LONG *)&g_BlockHistory[idx], (LONG)why);
+    (VOID)SkAtCas32(&g_BlockReason, (LONG)why, ShinkenBlockNone);
     ShOps.Diag("SHINKEN: unload block reason recorded (see ShRuntimeBlockHistory*)");
 }
 
-ULONG ShRuntimeBlockHistoryCount(void) { return (ULONG)g_BlockHistoryCount; }
+ULONG ShRuntimeBlockHistoryCount(void) { return (ULONG)SkAtOr32(&g_BlockHistoryCount, 0); }
 
 SHINKEN_BLOCK_REASON ShRuntimeBlockHistoryAt(ULONG index) {
-    if (index >= SHINKEN_BLOCK_HISTORY_CAP || (LONG)index >= g_BlockHistoryCount)
+    if (index >= SHINKEN_BLOCK_HISTORY_CAP || index >= ShRuntimeBlockHistoryCount())
         return ShinkenBlockNone;
-    return g_BlockHistory[index];
+    return (SHINKEN_BLOCK_REASON)SkAtOr32((volatile LONG *)&g_BlockHistory[index], 0);
 }
 
 VOID ShRuntimeEnterQuiescent(void) {
-    if (g_State == ShinkenTeardown)
-        g_State = ShinkenQuiescent;
+    (VOID)SkAtCas32(&g_State, ShinkenQuiescent, ShinkenTeardown);
 }
 
 VOID ShRuntimeEnterUnloadBlocked(SHINKEN_BLOCK_REASON why) {
     ShRuntimeRecordBlock(why);
-    if (g_State != ShinkenUnloadBlocked) {
-        g_State = ShinkenUnloadBlocked;
+    if (SkAtXchg32(&g_State, ShinkenUnloadBlocked) != ShinkenUnloadBlocked) {
         ShOps.Diag("SHINKEN: runtime enter UNLOAD_BLOCKED (resident failure)");
     }
 }
 
 VOID ShRuntimeBlockUnloadForever(void) {
-    ULONG iter = 0;
-    ShOps.Diag("SHINKEN: unload blocked; driver image stays resident; EvtDriverUnload parks");
-    for (;;) {
-        if (ShTestHook && ShTestHook->AbortBlockedWait && ShTestHook->AbortBlockedWait(iter))
-            return; // tests only: ShTestHook is always NULL in kernel builds
+    ShOps.Diag("SHINKEN: unload blocked; image and callback resources retained");
+    for (;;)
         ShOps.SleepMs(1000);
-        iter++;
-    }
 }
 
 BOOLEAN ShRuntimeRunUnload(BOOLEAN (*sensorQuiesce)(VOID), BOOLEAN (*divertQuiesce)(VOID),
@@ -346,11 +309,10 @@ BOOLEAN ShRuntimeRunUnload(BOOLEAN (*sensorQuiesce)(VOID), BOOLEAN (*divertQuies
     if (divertQuiesce)
         divertOk = divertQuiesce();
 
-    if (!sensorOk || !divertOk || g_State == ShinkenUnloadBlocked) {
-        // Policy b: any subsystem not quiescent => no destroy, driver stays resident
-        if (g_BlockReason == ShinkenBlockNone)
+    if (!sensorOk || !divertOk || ShRuntimeState() == ShinkenUnloadBlocked) {
+        if (ShRuntimeBlockReason() == ShinkenBlockNone)
             ShRuntimeRecordBlock(ShinkenBlockRundownStuck);
-        ShRuntimeEnterUnloadBlocked(g_BlockReason);
+        ShRuntimeEnterUnloadBlocked(ShRuntimeBlockReason());
         ShRuntimeBlockUnloadForever();
         return FALSE;
     }
@@ -366,7 +328,7 @@ BOOLEAN ShRuntimeRunUnload(BOOLEAN (*sensorQuiesce)(VOID), BOOLEAN (*divertQuies
     // return TRUE (returning lets KMDF unload the image while callbacks/
     // readers may still reference its code). No unloadable "Quiescent with
     // half-finished cleanup" state exists.
-    if (g_State == ShinkenUnloadBlocked) {
+    if (ShRuntimeState() == ShinkenUnloadBlocked) {
         ShRuntimeBlockUnloadForever();
         return FALSE;
     }
@@ -377,7 +339,7 @@ BOOLEAN ShRuntimeRunUnload(BOOLEAN (*sensorQuiesce)(VOID), BOOLEAN (*divertQuies
 VOID ShRuntimeReportUnderflow(SHINKEN_RUNDOWN *r) {
     SkAtAdd32(&r->underflows, 1);
     ShRuntimeRecordBlock(ShinkenBlockRundownUnderflow);
-    if (g_State == ShinkenTeardown)
+    if (ShRuntimeState() == ShinkenTeardown)
         ShRuntimeEnterUnloadBlocked(ShinkenBlockRundownUnderflow);
 }
 
@@ -396,192 +358,6 @@ VOID ShWfpObjectInit(SHINKEN_WFP_OBJECT *o, const char *name, UINT32 calloutId, 
     o->lastStatus = STATUS_SUCCESS;
 }
 
-VOID ShWfpObjectMark(SHINKEN_WFP_OBJECT *o, SHINKEN_WFP_OBJECT_STATE st) { o->state = st; }
-
-// ---------------------------------------------------------------------------
-// Unregister/delete error classification (teardown discipline):
-//   * STATUS_SUCCESS or the API's documented "object not found" status
-//     (FWP_E_*_NOT_FOUND, values in runtime.h) => Deleted: confirmed clear,
-//     no more callbacks possible;
-//   * STATUS_DEVICE_BUSY => transient: bounded retries (unregister strips
-//     flow contexts between rounds);
-//   * Any other status => **unknown error**: clear state untrustworthy,
-//     never mark Deleted; enter ShWfpLeaked terminal state — id/key/
-//     lastStatus/busyRetries all retained, caller records the block reason
-//     and stays resident; while an unconfirmed object exists, do not close
-//     the engine, free pools, or let DriverUnload return.
-// ---------------------------------------------------------------------------
-NTSTATUS ShWfpUnregisterCalloutById(SHINKEN_WFP_OBJECT *o, PVOID busyCtx,
-                                    VOID (*busyCleanup)(PVOID), ULONG maxBusyRetries,
-                                    ULONG delayMs) {
-    NTSTATUS st;
-    ULONG attempt;
-
-    if (o->state == ShWfpDeleted || o->state == ShWfpUnregistered)
-        return STATUS_SUCCESS; // idempotent: not on the books
-    if (o->state == ShWfpLeaked)
-        return STATUS_DEVICE_BUSY; // terminal: never touch again, caller stays resident
-    for (attempt = 0;; attempt++) {
-        st = ShOps.UnregisterCalloutById(o->id);
-        o->lastStatus = st;
-        if (st == STATUS_SUCCESS || st == FWP_E_CALLOUT_NOT_FOUND) {
-            // Success = code-level safety point: after FwpsCalloutUnregisterById0
-            // succeeds, WFP guarantees classifyFn/notifyFn/flowDeleteFn are no
-            // longer called (UNLOAD_SAFETY.md §2); NOT_FOUND = documented "not registered".
-            o->state = ShWfpDeleted;
-            o->busyRetries = attempt;
-            return st;
-        }
-        if (st != STATUS_DEVICE_BUSY) {
-            o->busyRetries = attempt;
-            o->state = ShWfpLeaked; // unknown error: clear state untrustworthy => residency
-            return st;
-        }
-        if (attempt >= maxBusyRetries) {
-            // BUSY root cause is usually an associated flow context; retries exhausted => LEAKED + residency
-            o->busyRetries = attempt + 1;
-            o->state = ShWfpLeaked;
-            return st;
-        }
-        if (busyCleanup)
-            busyCleanup(busyCtx); // strip flow contexts between rounds (see SkRemoveFlowContexts)
-        ShOps.SleepMs(delayMs);
-    }
-}
-
-NTSTATUS ShWfpUnregisterCalloutByKey(SHINKEN_WFP_OBJECT *o, ULONG maxBusyRetries, ULONG delayMs) {
-    NTSTATUS st;
-    ULONG attempt;
-
-    if (o->state == ShWfpDeleted || o->state == ShWfpUnregistered)
-        return STATUS_SUCCESS;
-    if (o->state == ShWfpLeaked)
-        return STATUS_DEVICE_BUSY;
-    for (attempt = 0;; attempt++) {
-        st = ShOps.UnregisterCalloutByKey(o->key);
-        o->lastStatus = st;
-        if (st == STATUS_SUCCESS || st == FWP_E_CALLOUT_NOT_FOUND) {
-            o->state = ShWfpDeleted;
-            o->busyRetries = attempt;
-            return st;
-        }
-        if (st != STATUS_DEVICE_BUSY) {
-            o->busyRetries = attempt;
-            o->state = ShWfpLeaked; // unknown error => residency
-            return st;
-        }
-        if (attempt >= maxBusyRetries) {
-            o->busyRetries = attempt + 1;
-            o->state = ShWfpLeaked;
-            return st;
-        }
-        ShOps.SleepMs(delayMs);
-    }
-}
-NTSTATUS ShWfpDeleteFilterById(SHINKEN_WFP_OBJECT *o, HANDLE engine) {
-    if (o->state == ShWfpLeaked)
-        return STATUS_DEVICE_BUSY;
-    if (o->filterId == 0 || o->state == ShWfpDeleted)
-        return STATUS_SUCCESS;
-    o->state = ShWfpDeletePending;
-    o->lastStatus = ShOps.FilterDeleteById(engine, o->filterId);
-    if (o->lastStatus == STATUS_SUCCESS || o->lastStatus == FWP_E_FILTER_NOT_FOUND) {
-        o->state = ShWfpDeleted; // success or documented "not found": confirmed clear
-        o->filterId = 0;
-        return o->lastStatus;
-    }
-    o->state = ShWfpLeaked; // unknown error: not confirmed clear (engine object remains)
-    return o->lastStatus;
-}
-
-NTSTATUS ShWfpDeleteFilterByKey(SHINKEN_WFP_OBJECT *o, HANDLE engine) {
-    if (o->state == ShWfpLeaked)
-        return STATUS_DEVICE_BUSY;
-    if (o->key == NULL || o->state == ShWfpDeleted)
-        return STATUS_SUCCESS;
-    o->state = ShWfpDeletePending;
-    o->lastStatus = ShOps.FilterDeleteByKey(engine, o->key);
-    if (o->lastStatus == STATUS_SUCCESS || o->lastStatus == FWP_E_FILTER_NOT_FOUND) {
-        o->state = ShWfpDeleted;
-        return o->lastStatus;
-    }
-    o->state = ShWfpLeaked;
-    return o->lastStatus;
-}
-
-NTSTATUS ShWfpDeleteCalloutById(SHINKEN_WFP_OBJECT *o, HANDLE engine) {
-    if (o->state == ShWfpLeaked)
-        return STATUS_DEVICE_BUSY;
-    if (o->id == 0 || o->state == ShWfpDeleted)
-        return STATUS_SUCCESS;
-    o->state = ShWfpDeletePending;
-    o->lastStatus = ShOps.CalloutDeleteById(engine, o->id);
-    if (o->lastStatus == STATUS_SUCCESS || o->lastStatus == FWP_E_CALLOUT_NOT_FOUND) {
-        o->state = ShWfpDeleted;
-        o->id = 0;
-        return o->lastStatus;
-    }
-    o->state = ShWfpLeaked;
-    return o->lastStatus;
-}
-
-NTSTATUS ShWfpDeleteCalloutByKey(SHINKEN_WFP_OBJECT *o, HANDLE engine) {
-    if (o->state == ShWfpLeaked)
-        return STATUS_DEVICE_BUSY;
-    if (o->key == NULL || o->state == ShWfpDeleted)
-        return STATUS_SUCCESS;
-    o->state = ShWfpDeletePending;
-    o->lastStatus = ShOps.CalloutDeleteByKey(engine, o->key);
-    if (o->lastStatus == STATUS_SUCCESS || o->lastStatus == FWP_E_CALLOUT_NOT_FOUND) {
-        o->state = ShWfpDeleted;
-        return o->lastStatus;
-    }
-    o->state = ShWfpLeaked;
-    return o->lastStatus;
-}
-
-NTSTATUS ShWfpDeleteProviderByKey(SHINKEN_WFP_OBJECT *o, HANDLE engine) {
-    if (o->state == ShWfpLeaked)
-        return STATUS_DEVICE_BUSY;
-    if (o->key == NULL || o->state == ShWfpDeleted)
-        return STATUS_SUCCESS;
-    o->state = ShWfpDeletePending;
-    o->lastStatus = ShOps.ProviderDeleteByKey(engine, o->key);
-    if (o->lastStatus == STATUS_SUCCESS || o->lastStatus == FWP_E_PROVIDER_NOT_FOUND) {
-        o->state = ShWfpDeleted;
-        return o->lastStatus;
-    }
-    o->state = ShWfpLeaked;
-    return o->lastStatus;
-}
-
-NTSTATUS ShWfpDeleteSubLayerByKey(SHINKEN_WFP_OBJECT *o, HANDLE engine) {
-    if (o->state == ShWfpLeaked)
-        return STATUS_DEVICE_BUSY;
-    if (o->key == NULL || o->state == ShWfpDeleted)
-        return STATUS_SUCCESS;
-    o->state = ShWfpDeletePending;
-    o->lastStatus = ShOps.SubLayerDeleteByKey(engine, o->key);
-    if (o->lastStatus == STATUS_SUCCESS || o->lastStatus == FWP_E_SUBLAYER_NOT_FOUND) {
-        o->state = ShWfpDeleted;
-        return o->lastStatus;
-    }
-    o->state = ShWfpLeaked;
-    return o->lastStatus;
-}
-
-NTSTATUS ShWfpEngineClose(SHINKEN_WFP_OBJECT *o, HANDLE engine) {
-    if (o->state == ShWfpLeaked)
-        return STATUS_DEVICE_BUSY; // engine handle retained (part of the residency condition)
-    o->lastStatus = ShOps.EngineClose(engine);
-    if (o->lastStatus == STATUS_SUCCESS) {
-        // FwpmEngineClose0 has no documented "not found" form: only SUCCESS confirms closure
-        o->state = ShWfpDeleted;
-        return STATUS_SUCCESS;
-    }
-    o->state = ShWfpLeaked;
-    return o->lastStatus;
-}
 
 // ---------------------------------------------------------------------------
 // in-flight injection (dedicated rundown implementation, proof in runtime.h)
@@ -604,20 +380,8 @@ LONG ShInjectionInFlight(void) {
 VOID ShInjectionGateStop(void) { ShRundownBeginStop(&g_InjectionRundown); }
 
 NTSTATUS ShInjectionDrain(ULONG retries, ULONG delayMs) {
-    ULONG i;
-    // Correct protocol: caller does ShInjectionGateStop() first (quiesce).
-    // Compatibility semantics: without GateStop this degrades to a bare count
-    // observation (diagnostics/tests); success then proves nothing about
-    // handle-destroy safety.
-    for (i = 0;; i++) {
-        LONG c = g_InjectionRundown.count;
-        if (c == SHINKEN_RUNDOWN_STOP_BIT || c == 0)
-            // stopped and drained, or not stopped but currently no in-flight (compat path)
-            return STATUS_SUCCESS;
-        if (i >= retries)
-            return SHINKEN_STATUS_TIMEOUT;
-        ShOps.SleepMs(delayMs);
-    }
+    // A zero holder count without a closed gate is not a drain proof.
+    return ShRundownDrain(&g_InjectionRundown, retries, delayMs);
 }
 
 NTSTATUS ShInjectionDestroyTracked(SHINKEN_WFP_OBJECT *o, HANDLE handle, ULONG maxBusyRetries,
@@ -663,17 +427,5 @@ VOID ShHandleOpen(void) { SkAtAdd64(&g_HandlesOpen, 1); }
 
 VOID ShHandleClose(void) { SkAtSub64(&g_HandlesOpen, 1); }
 
-LONG64 ShHandlesOpen(void) { return g_HandlesOpen; }
+LONG64 ShHandlesOpen(void) { return SkAtAdd64(&g_HandlesOpen, 0); }
 
-// ---------------------------------------------------------------------------
-// Host-test only: reset runtime globals (not compiled in kernel builds)
-// ---------------------------------------------------------------------------
-#ifdef SHINKEN_HOST_TEST
-VOID ShTestReset(VOID) {
-    g_State = ShinkenUninitialized;
-    g_BlockReason = ShinkenBlockNone;
-    g_BlockHistoryCount = 0;
-    g_HandlesOpen = 0;
-    ShRuntimeInit();
-}
-#endif

@@ -6,12 +6,13 @@
 // enabled rule is the verdict. No match => snapshot defaultPolicy; snap==NULL
 // (store closed) => default PERMIT (permit never flips on store state;
 // unload-time traffic is not killed by mistake).
-// RATE_LIMIT: fixed 64-slot token-bucket table (ruleId -> {tokens,
-//   lastRefillMs, rateSig}, EX_SPIN_LOCK). Buckets are keyed by ruleId and a
-//   rate-parameter signature (rateTokens/rateIntervalMs). When a rule's rate
-//   parameters change, the signature mismatch resets the bucket on the next
-//   classify; delete/disable/replaced-away rules are zeroed by rule_store via
-//   SkRuleRateReset. Refill uses saturating unsigned 64-bit arithmetic
+// RATE_LIMIT: one reference-counted SK_RATE_BUCKET object per RATE_LIMIT
+//   rule, carried by the snapshot (snap->buckets[i], rule_store.h) and
+//   shared across publishes for unchanged rules — no global table, no ruleId
+//   slot scan, no 64-slot ceiling and no table-full fail-open. Buckets are
+//   allocated by the writer (allocation failure aborts the publish; the old
+//   policy stays); this file only consumes them under the per-bucket spin
+//   lock. Refill uses saturating unsigned 64-bit arithmetic
 //   (intervals*rateTokens, tokens+add, intervals*rateIntervalMs, QPC ticks*1000,
 //   ticks*1000000000); overflow clamps to UINT64_MAX instead of wrapping.
 //   Refill rateTokens per rateIntervalMs, cap burst; within bucket permit as
@@ -83,128 +84,45 @@ static UINT64 SkTicksToNs(UINT64 ticks) {
 }
 
 // ---------------------------------------------------------------------------
-// RATE_LIMIT token bucket table (fixed 64 slots; documented demo-scale limit)
+// RATE_LIMIT token buckets (per-rule objects; allocation/ownership and the
+// share-across-publishes rules live in rule_store.c)
 // ---------------------------------------------------------------------------
-#define SK_RATE_TABLE_SIZE 64
-typedef struct _SK_RATE_ENTRY {
-    UINT64 ruleId;
-    UINT64 tokens;       // current token count (<= burst)
-    UINT64 lastRefillMs; // last refill time, QPC ms
-    UINT64 rateSig;      // signature of rateTokens/rateIntervalMs; mismatch => reset bucket
-    UINT32 inUse;
-} SK_RATE_ENTRY;
 
-static SK_RATE_ENTRY g_RateTable[SK_RATE_TABLE_SIZE];
-static EX_SPIN_LOCK g_RateLock;
-
-// Rate-parameter signature: detects when a rule's refill parameters change so
-// the bucket can be reset. Derived from rateTokens and rateIntervalMs only;
-// burst-only changes are handled by SkRuleRateClampBurst.
-static UINT64 SkRateParamsSig(const SK_RULE *rule) {
-    UINT64 sig = 14695981039346656037ULL; // FNV-1a64 offset basis
-    sig ^= rule->rateTokens;
-    sig *= 1099511628211ULL;              // FNV-1a64 prime
-    sig ^= rule->rateIntervalMs;
-    sig *= 1099511628211ULL;
-    return sig;
-}
-
-// TRUE = within bucket; FALSE = over limit. Table full (all 64 slots used) =>
-// fail-open permit: losing rate-limiter state beats killing traffic by
-// mistake (documented demo-scale limit; the table is image-level state, not
-// freed with snapshots).
-static BOOLEAN SkRateAllow(const SK_RULE *rule) {
+// TRUE = within bucket; FALSE = over limit. The bucket always exists
+// (snapshot invariant: buckets[i] != NULL for a RATE_LIMIT rule) — no
+// allocation here and no fail-open path. A fresh bucket starts full; its
+// first evaluation anchors the refill clock rather than counting from boot.
+static BOOLEAN SkRateAllow(const SK_RULE *rule, SK_RATE_BUCKET *bucket) {
     KIRQL irql;
-    UINT32 i, slot;
-    UINT64 now, intervals, add, sig;
-    SK_RATE_ENTRY *e;
+    UINT64 now, intervals, add, tokens;
     BOOLEAN allowed;
     now = SkQpcMs();
-    slot = SK_RATE_TABLE_SIZE;
-    irql = ShOps.LockAcquireExclusive(&g_RateLock);
-    for (i = 0; i < SK_RATE_TABLE_SIZE; i++) {
-        if (g_RateTable[i].inUse && g_RateTable[i].ruleId == rule->ruleId) {
-            slot = i;
-            break;
+    irql = ShOps.LockAcquireExclusive(&bucket->lock);
+    tokens = bucket->tokens;
+    // Refill: rateTokens per rateIntervalMs, capped at the rule's burst.
+    if (!bucket->started) {
+        bucket->lastRefillMs = now;
+        bucket->started = TRUE;
+    } else if (now > bucket->lastRefillMs) {
+        intervals = (now - bucket->lastRefillMs) / rule->rateIntervalMs;
+        if (intervals != 0) {
+            add = SkSatMulU64(intervals, rule->rateTokens);
+            tokens = SkSatAddU64(tokens, add);
+            if (tokens > rule->burst)
+                tokens = rule->burst;
+            bucket->lastRefillMs = SkSatAddU64(bucket->lastRefillMs,
+                                               SkSatMulU64(intervals, rule->rateIntervalMs));
         }
-        if (!g_RateTable[i].inUse && slot == SK_RATE_TABLE_SIZE)
-            slot = i; // remember first free slot
     }
-    if (slot == SK_RATE_TABLE_SIZE) {
-        allowed = TRUE; // fail-open
+    if (tokens > 0) {
+        bucket->tokens = tokens - 1;
+        allowed = TRUE;
     } else {
-        e = &g_RateTable[slot];
-        sig = SkRateParamsSig(rule);
-        if (!e->inUse) {
-            e->inUse = 1;
-            e->ruleId = rule->ruleId;
-            e->tokens = rule->burst; // new bucket starts full
-            e->lastRefillMs = now;
-            e->rateSig = sig;
-        } else if (e->rateSig != sig) {
-            // Rate parameters changed (rateTokens/rateIntervalMs); reset bucket
-            // so a reused/changed ruleId never inherits the old refill schedule.
-            e->tokens = rule->burst;
-            e->lastRefillMs = now;
-            e->rateSig = sig;
-        }
-        // Refill: rateTokens per rateIntervalMs, capped at burst
-        if (now > e->lastRefillMs) {
-            intervals = (now - e->lastRefillMs) / rule->rateIntervalMs;
-            if (intervals != 0) {
-                add = SkSatMulU64(intervals, rule->rateTokens);
-                e->tokens = SkSatAddU64(e->tokens, add);
-                if (e->tokens > rule->burst)
-                    e->tokens = rule->burst;
-                e->lastRefillMs = SkSatAddU64(e->lastRefillMs,
-                                              SkSatMulU64(intervals, rule->rateIntervalMs));
-            }
-        }
-        if (e->tokens > 0) {
-            e->tokens--;
-            allowed = TRUE;
-        } else {
-            allowed = FALSE;
-        }
+        bucket->tokens = tokens;
+        allowed = FALSE;
     }
-    ShOps.LockReleaseExclusive(&g_RateLock, irql);
+    ShOps.LockReleaseExclusive(&bucket->lock, irql);
     return allowed;
-}
-
-// Zero the whole slot (not just inUse): a reused ruleId never inherits any
-// residue (tokens/lastRefillMs/rateSig cleared too; reuse also starts a fresh
-// full bucket in SkRateAllow — belt and braces).
-VOID SkRuleRateReset(UINT64 ruleId) {
-    KIRQL irql;
-    UINT32 i;
-    irql = ShOps.LockAcquireExclusive(&g_RateLock);
-    for (i = 0; i < SK_RATE_TABLE_SIZE; i++) {
-        if (g_RateTable[i].inUse && g_RateTable[i].ruleId == ruleId) {
-            g_RateTable[i].inUse = 0;
-            g_RateTable[i].ruleId = 0;
-            g_RateTable[i].tokens = 0;
-            g_RateTable[i].lastRefillMs = 0;
-            g_RateTable[i].rateSig = 0;
-            break;
-        }
-    }
-    ShOps.LockReleaseExclusive(&g_RateLock, irql);
-}
-
-// Clamp an existing bucket to a reduced burst. Called by the Update path when
-// a rule's burst shrinks; if the bucket does not exist this is a no-op.
-VOID SkRuleRateClampBurst(UINT64 ruleId, UINT32 newBurst) {
-    KIRQL irql;
-    UINT32 i;
-    irql = ShOps.LockAcquireExclusive(&g_RateLock);
-    for (i = 0; i < SK_RATE_TABLE_SIZE; i++) {
-        if (g_RateTable[i].inUse && g_RateTable[i].ruleId == ruleId) {
-            if (g_RateTable[i].tokens > (UINT64)newBurst)
-                g_RateTable[i].tokens = (UINT64)newBurst;
-            break;
-        }
-    }
-    ShOps.LockReleaseExclusive(&g_RateLock, irql);
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +174,7 @@ VOID SkRuleEvaluate(const SK_RULE_SNAPSHOT *snap, const SK_CLASSIFY_TUPLE *tuple
             out->action = (UINT32)SkVerdictAudit; // permit + telemetry
             break;
         case SkRuleActionRateLimit:
-            if (SkRateAllow(hit)) {
+            if (SkRateAllow(hit, snap->buckets[i])) {
                 out->action = (UINT32)SkVerdictAudit; // within bucket: permit with AUDIT semantics
             } else {
                 out->action = (UINT32)SkVerdictBlock;

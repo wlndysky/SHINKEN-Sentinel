@@ -8,9 +8,8 @@
 // owns the NBL and returns the reference exactly once
 // (ShInjectionEnd).
 // teardown: GateStop -> Drain -> destroy handles -> destroy pools.
-// Self-injection guard: SkInjectIsSelf recognizes packets injected by
-// this driver (tagged injection context); classify/reinject paths
-// permit them directly — no re-classification / infinite loop.
+// Packet injection state must be obtained from WFP's injection-state API;
+// the ALE flow-context pointer must never be treated as an injection tag.
 // ============================================================================
 #pragma once
 #include <ntddk.h>
@@ -21,19 +20,15 @@ extern "C" {
 #endif
 
 // injection subsystem lifecycle
-// SkInjectInit: state bit g_SkInjectInited==1 <=> handles+pools exist (strict
-// pairing on every failure path); idempotent while initialized; refused
-// (STATUS_INVALID_DEVICE_STATE) after a successful quiesce — the injection
-// gate's stop bit is irreversible, so re-init would create unusable handles.
+// SkInjectInit publishes readiness only after both handles and pools exist.
+// Failed partial initialization runs tracked teardown; unconfirmed destruction
+// keeps ownership and blocks unload. Re-init after quiesce is refused.
 NTSTATUS SkInjectInit(void);        // create injection handles + NBL/NB pools
 BOOLEAN SkInjectQuiesce(void);      // GateStop + drain in-flight + destroy handles;
                                     // on full success clears the init state bit
                                     // (re-init is then refused)
 VOID SkInjectDestroy(void);         // destroy pools (after handle destroy)
 
-// self-injection check (SK_INJECT_TAG written into the injection context at submit; compared in classify)
-#define SK_INJECT_TAG 0x534B4A54u // 'SKJT'
-BOOLEAN SkInjectIsSelf(UINT64 injectionContext);
 
 #ifdef __cplusplus
 }

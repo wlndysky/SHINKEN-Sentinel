@@ -1,58 +1,8 @@
-// ============================================================================
-// runtime/lifecycle.c — subsystem lifecycle orchestration (contract in
-// lifecycle.h; ordering rationale inline below).
-//
-// Start order (SkLifecycleStart; any step failure rolls back completed steps
-// in reverse):
-//   0. SkDeviceCreate             control device + queue + symlink (DriverEntry,
-//                                 BEFORE this function; tracked as SK_STEP_DEVICE —
-//                                 the device is an owned resource of the rollback
-//                                 graph even when no later step ever ran)
-//   1. SkRuleStoreInit            rule store (empty snapshot version 0)
-//   2. telemetry queue init (static storage) + event thread start
-//   3. SkControlInit              control-plane thread/gate (means thread/gate
-//                                 ready, NOT device created — the device is step 0)
-//   4. SkInjectInit               injection handle + NBL/NB pools
-//
-// Quiesce order (SkLifecycleQuiesce; failure => FALSE, runtime stays resident):
-//   1. close IOCTL new-request gate (SkControlQuiesce: latch + wait handles==0)
-//   2. rule write gate: IsActive==FALSE after ShRuntimeBeginTeardown closes it
-//      (rechecked via SkRuleStoreWritable; snapshot reader drain is guaranteed
-//      by the rule_store rundown)
-//   3. telemetry stop (ShEventThreadStop: close producer gate + join + drain)
-//   4. injection gate (SkInjectQuiesce: GateStop + drain + destroy handle)
-//   5. BFE unsubscribe + ShRundownBfe BeginStop/Drain (bounded wait)
-//   6. WFP teardown (SkWfpManagerTeardown: per callout the flow-attach gate
-//      is closed and in-flight attaches drained BEFORE the callout-unregister
-//      documented safety point; flow contexts are stripped and settled
-//      (bounded) before unregister — the unregister contract forfeits
-//      flowDeleteFn — with busyCleanup stripping between BUSY retries; a
-//      strip that will not settle blocks unload; then engine objects
-//      deleted + engine closed)
-//   7. drain ShRundownWorkItem
-//   8. event-thread final re-check (idempotent)
-// Destroy order (SkLifecycleDestroy, only after ShRuntimeDestroyAllowed):
-//   SkInjectDestroy (pools) -> SkFlowDestroy -> SkRuleStoreShutdown (snapshot
-//   free; drain failure => UNLOAD_BLOCKED and the destroy chain stops
-//   immediately) -> SkControlDestroy (delete device). Engine close already
-//   done at teardown (step 6).
-//
-// UNLOAD_BLOCKED policy (demo-only): any quiesce/rollback failure =>
-// runtime enters UNLOAD_BLOCKED and EvtDriverUnload never returns — the
-// image can never be unloaded while any drain failed, so code referenced
-// by WFP/BFE/work-item callbacks stays valid. The rationale: KMDF has no
-// "refuse unload" result, so the only safe failure policy is not
-// returning. Cost: sc stop sits in STOP_PENDING until SCM times out. The
-// resident loop holds no locks/resources and can be interrupted at
-// shutdown.
-// Diagnosability: ShRuntimeBlockReason (first cause) + g_BlockHistory (all
-// causes) + per-object state/lastStatus/busyRetries.
-//
-// Idempotent: repeated quiesce/destroy safe; partial-init rollback reuses the
-// same function pair. BFE callback: on engine recovery (FWPM_SERVICE_RUNNING)
-// re-runs SkWfpManagerInstall; the callback body is wrapped in ShRundownBfe
-// Acquire/Release (the drain target of unload step 5).
-// ============================================================================
+// Initialize all callback-visible state before subscribing to BFE; publish
+// the control device only after startup succeeds (DriverEntry).
+// Shutdown cuts the BFE callback source before touching the WFP manager.
+// A confirmed dynamic-session close removes filters before runtime callout
+// unregister. No subsystem destroy runs while any owner remains unconfirmed.
 #include <ntddk.h>
 #include "runtime.h"
 #include "rundown.h"
@@ -75,18 +25,14 @@
 #define SK_STEP_CONTROL 0x04 // SkControlInit succeeded: consumer thread + request gate ready
 #define SK_STEP_INJECT  0x08
 #define SK_STEP_BFE     0x10
-#define SK_STEP_WFP     0x20
 #define SK_STEP_FLOW    0x40
 #define SK_STEP_DEVICE  0x80 // SkDeviceCreate succeeded (DriverEntry): named device + symlink exist
 
 static ULONG g_SkSteps;                  // completed start steps
 static PDEVICE_OBJECT g_SkDevice;        // control device WDM object (for callout registration)
-static BOOLEAN g_SkWfpDeferred;          // BFE not running: install deferred to BFE callback
 HANDLE g_SkBfeChangeHandle;              // BFE subscription handle (global: diagnostics/tests)
 
-// Telemetry queue: driver-level singleton in telemetry/event_queue.c
-// (g_SkTelemetryQueue, image-level storage, never freed — same discipline as
-// rundown invariant 9); lifecycle only orchestrates Init/Start/Stop.
+// Telemetry uses image-static bounded storage; lifecycle owns its thread.
 
 // Keep the first cause if a subsystem already recorded one; otherwise record this step's fallback cause.
 static VOID skRecordIfNone(SHINKEN_BLOCK_REASON why) {
@@ -94,23 +40,19 @@ static VOID skRecordIfNone(SHINKEN_BLOCK_REASON why) {
         ShRuntimeRecordBlock(why);
 }
 
-// ---------------------------------------------------------------------------
-// BFE state-change callback (may arrive on a BFE service thread, PASSIVE):
-// engine recovered (FWPM_SERVICE_RUNNING) => (re)install WFP objects.
-// Rundown-wrapped: after unload step 5 BeginStop, Acquire must fail so the
-// callback never touches the manager; in-flight callbacks before BeginStop
-// are always awaited by Drain (proof in rundown.h).
-// ---------------------------------------------------------------------------
+// BFE callbacks may arrive during initialization, before runtime activation.
+// All resources they need are initialized before subscription. Rollback must
+// unsubscribe and drain this rundown before it tears the manager down.
 static VOID NTAPI SkBfeStateChangeCallback(PVOID context, FWPM_SERVICE_STATE state) {
+    NTSTATUS st;
     UNREFERENCED_PARAMETER(context);
     if (!ShRundownAcquire(&ShRundownBfe))
-        return; // unload/rollback in progress: callback covered by unsubscribe+drain
-    if (state == FWPM_SERVICE_RUNNING && ShRuntimeIsActive() && g_SkDevice != NULL) {
-        // Install is idempotent (manager.installed gate); on failure stay deferred, retried on next state transition
-        if (SkWfpManagerInstall(g_SkDevice) >= 0)
-            g_SkWfpDeferred = FALSE;
-        else
-            g_SkWfpDeferred = TRUE;
+        return;
+    if (ShRuntimeState() != ShinkenTeardown &&
+        ShRuntimeState() != ShinkenUnloadBlocked && g_SkDevice != NULL) {
+        st = SkWfpManagerBfeStateChange(g_SkDevice, state);
+        if (!NT_SUCCESS(st))
+            ShOps.Diag("SHINKEN: BFE synchronization failed; manager retains ownership");
     }
     ShRundownRelease(&ShRundownBfe);
 }
@@ -120,6 +62,7 @@ static VOID NTAPI SkBfeStateChangeCallback(PVOID context, FWPM_SERVICE_STATE sta
 // residency-level error) -> BeginStop -> bounded drain of in-flight callbacks.
 // ---------------------------------------------------------------------------
 static BOOLEAN skBfeQuiesce(void) {
+    ShRundownBeginStop(&ShRundownBfe);
     if (g_SkBfeChangeHandle != NULL) {
         NTSTATUS st = ShOps.BfeUnsubscribe(g_SkBfeChangeHandle);
         if (st != STATUS_SUCCESS) {
@@ -130,7 +73,6 @@ static BOOLEAN skBfeQuiesce(void) {
         }
         g_SkBfeChangeHandle = NULL; // documented success: no new callbacks
     }
-    ShRundownBeginStop(&ShRundownBfe);
     if (ShRundownDrain(&ShRundownBfe, SK_LIFECYCLE_DRAIN_RETRIES,
                       SK_LIFECYCLE_DRAIN_DELAY_MS) != STATUS_SUCCESS) {
         skRecordIfNone(ShinkenBlockBfeCallbackActive); // in-flight callback won't leave: residency
@@ -140,15 +82,11 @@ static BOOLEAN skBfeQuiesce(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Telemetry quiesce (shared by start rollback and unload): stop the event
-// thread (close producer gate + join + fallback drain); failure (producers
-// stuck / join failed / queue non-empty) => residency-level error.
+// Telemetry closes producer admission under its queue lock, drains queued
+// records on the consumer, and joins before reporting success.
 // ---------------------------------------------------------------------------
 static BOOLEAN skEventQuiesce(void) {
-    // exact compare: ShEventThreadStop returns SHINKEN_STATUS_TIMEOUT (0x102,
-    // positive) when producers/thread refuse to drain; NT_SUCCESS/`< 0` would
-    // misread it as stopped and let destroy run under a live event thread.
-    if (ShEventThreadStop(&g_SkTelemetryQueue) != STATUS_SUCCESS) {
+    if (SkTelemetryStop() != STATUS_SUCCESS) {
         skRecordIfNone(ShinkenBlockEventThreadDrain);
         return FALSE;
     }
@@ -183,28 +121,15 @@ BOOLEAN SkLifecycleQuiesce(void) {
         skRecordIfNone(ShinkenBlockInjectionDrain);
         ok = FALSE;
     }
-    // 5) BFE unsubscribe + drain callback rundown (must precede WFP teardown:
-    //    callbacks may trigger reinstall; cut the callback source first)
-    if (!skBfeQuiesce())
+    // Prevent reinstall before closing the session and unregistering callouts.
+    // A failed unsubscribe/drain means the manager must remain untouched.
+    if (!skBfeQuiesce()) {
         ok = FALSE;
-    // 6) WFP teardown: per callout, close the flow-attach gate and drain
-    //    in-flight FwpsFlowAssociateContext0 BEFORE the unregister safe
-    //    point, strip + settle flow contexts before unregister (a strip
-    //    that will not settle blocks unload), then delete engine
-    //    objects + close engine; records precise reasons internally
-    if (!SkWfpManagerTeardown()) {
+    } else if (!SkWfpManagerTeardown()) {
         skRecordIfNone(ShinkenBlockEngineClose);
         ok = FALSE;
     }
-    // 7) drain work item rundown (Io* work item in flight => bounded wait)
-    ShRundownBeginStop(&ShRundownWorkItem);
-    if (ShRundownDrain(&ShRundownWorkItem, SK_LIFECYCLE_DRAIN_RETRIES,
-                      SK_LIFECYCLE_DRAIN_DELAY_MS) != STATUS_SUCCESS) {
-        skRecordIfNone(ShinkenBlockWorkItemDrain);
-        ok = FALSE;
-    }
-    // 8) event-thread final re-check (idempotent; must be FALSE after step 3 succeeded)
-    if (ShEventThreadRunning(&g_SkTelemetryQueue)) {
+    if (SkTelemetryRunning()) {
         skRecordIfNone(ShinkenBlockEventThreadDrain);
         ok = FALSE;
     }
@@ -219,7 +144,10 @@ VOID SkLifecycleDestroy(void) {
     if (!ShRuntimeDestroyAllowed())
         return; // resident terminal state: all destroy forbidden (defense in depth; runtime gate is first)
     SkInjectDestroy();      // destroy injection pools (handle already destroyed at quiesce)
-    SkFlowDestroy();        // flow context table (WFP teardown at quiesce stripped all associations)
+    if (!SkFlowDestroy()) {
+        ShRuntimeEnterUnloadBlocked(ShinkenBlockFlowContextDrain);
+        return;
+    }
     // Free rule snapshots: any snapshot still has readers => shutdown already
     // called EnterUnloadBlocked; the destroy chain must stop immediately — do
     // not run SkControlDestroy or any later destroy, do not clear
@@ -245,17 +173,15 @@ VOID SkLifecycleDestroy(void) {
 static BOOLEAN skLifecycleRollback(void) {
     BOOLEAN ok = TRUE;
 
-    ShRuntimeBeginTeardown(); // never activated: gate with nothing to drain (idempotent)
-    // Reverse order: WFP -> BFE -> injection -> control -> telemetry (quiesce part)
-    // If WFP install failed, the manager already rolled back internally;
-    // teardown is idempotent and also catches the "internal rollback itself
-    // LEAKED" form (returns FALSE)
-    if (!SkWfpManagerTeardown()) {
+    ShRuntimeBeginTeardown();
+    // The subscription exists before the first install. Stop callbacks first
+    // even during failed startup; otherwise they can reinstall behind rollback.
+    if ((g_SkSteps & SK_STEP_BFE) && !skBfeQuiesce()) {
+        ok = FALSE;
+    } else if (!SkWfpManagerTeardown()) {
         skRecordIfNone(ShinkenBlockEngineClose);
         ok = FALSE;
     }
-    if ((g_SkSteps & SK_STEP_BFE) && !skBfeQuiesce())
-        ok = FALSE;
     if ((g_SkSteps & SK_STEP_INJECT) && !SkInjectQuiesce()) {
         skRecordIfNone(ShinkenBlockInjectionDrain);
         ok = FALSE;
@@ -266,13 +192,13 @@ static BOOLEAN skLifecycleRollback(void) {
     }
     if ((g_SkSteps & SK_STEP_EVENTQ) && !skEventQuiesce())
         ok = FALSE;
-    if (!ok)
-        return FALSE; // quiesce not all passed: destroy fully forbidden (objects kept, residency)
-    // destroy part (state Uninitialized => ShRuntimeDestroyAllowed is TRUE)
+    if (!ok || ShRuntimeState() == ShinkenUnloadBlocked)
+        return FALSE;
+    // Destroy only after every owner and runtime failure state is clear.
     if (g_SkSteps & SK_STEP_INJECT)
         SkInjectDestroy();
-    if (g_SkSteps & SK_STEP_FLOW)
-        SkFlowDestroy();
+    if ((g_SkSteps & SK_STEP_FLOW) && !SkFlowDestroy())
+        return FALSE;
     if (g_SkSteps & SK_STEP_RULES) {
         // Snapshot drain failure => already UNLOAD_BLOCKED internally: destroy
         // chain stops, g_SkSteps kept (failure scene), rollback fails (residency)
@@ -300,27 +226,18 @@ static BOOLEAN skLifecycleRollback(void) {
     return TRUE;
 }
 
-// ---------------------------------------------------------------------------
-// SkLifecycleStart: order in file header. Full success => STATUS_SUCCESS
-// (ShRuntimeActivate is done by DriverEntry afterwards — before activation
-// the runtime rejects new async refs and all subsystem gates stay closed, so
-// no "callback references a not-yet-ready subsystem" window during install).
-// Any step failure: internal rollback; rollback failure => UNLOAD_BLOCKED +
-// STATUS_DEVICE_BUSY (DriverEntry detects the resident terminal state and
-// BlockUnloadForever instead of returning a failure code).
-// ---------------------------------------------------------------------------
+// Startup is private until DriverEntry publishes the control device.
+// Callback resources are ready before BFE subscription; the initial query
+// and later notifications serialize inside the manager.
 NTSTATUS SkLifecycleStart(PDRIVER_OBJECT driverObject, PDEVICE_OBJECT wdmDevice) {
     NTSTATUS status;
-    FWPM_SERVICE_STATE bfeState;
 
     // SK_STEP_DEVICE first: DriverEntry's SkDeviceCreate succeeded immediately
     // before this call (wdmDevice is its product), so the named device +
     // symlink enter the rollback graph before any step that can fail.
     g_SkSteps = SK_STEP_DEVICE;
     g_SkDevice = wdmDevice;
-    g_SkWfpDeferred = FALSE;
-    SkWfpManagerInitMutex(); // KMUTEX one-time init (idempotent via BSS flag; must
-                             // precede any install/teardown/BFE callback reachability)
+    SkWfpManagerInitMutex(); // before installation or callback publication
 
 
     // 1) rule store
@@ -366,24 +283,21 @@ NTSTATUS SkLifecycleStart(PDRIVER_OBJECT driverObject, PDEVICE_OBJECT wdmDevice)
     }
     g_SkSteps |= SK_STEP_BFE;
 
-    // 6) WFP install: BFE running => install now; not running => subscribe
-    //    only, defer to the BFE callback
-    bfeState = FwpmBfeStateGet0();
-    if (bfeState == FWPM_SERVICE_RUNNING) {
-        status = SkWfpManagerInstall(wdmDevice);
-        if (status < 0)
-            goto rollback; // internally rolled back; rollback LEAKED is caught by skLifecycleRollback
-        g_SkSteps |= SK_STEP_WFP;
-    } else {
-        g_SkWfpDeferred = TRUE;
+    // The manager checks the live BFE state under its installation lock.
+    // Notifications are accepted even before ShRuntimeActivate, closing the
+    // query/activation window that could otherwise lose the RUNNING event.
+    status = SkWfpManagerInstall(wdmDevice);
+    if (!NT_SUCCESS(status) || ShRuntimeState() == ShinkenUnloadBlocked) {
+        if (NT_SUCCESS(status))
+            status = STATUS_DEVICE_BUSY;
+        goto rollback;
     }
 
     return STATUS_SUCCESS;
 
 rollback:
     if (!skLifecycleRollback()) {
-        // Rollback itself failed: object clear state untrustworthy => resident
-        // terminal state (STATUS_DEVICE_BUSY reachable only via the test hook)
+        // Rollback failed: preserve owners and enter resident terminal state.
         ShRuntimeEnterUnloadBlocked(ShRuntimeBlockReason());
         return STATUS_DEVICE_BUSY;
     }

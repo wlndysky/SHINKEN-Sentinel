@@ -6,13 +6,19 @@
 //     (SDDL) → WdfDeviceInit* config → WdfDeviceCreate → default IOCTL queue →
 //     symbolic link; it merely wires callbacks into WDF_FILEOBJECT_CONFIG /
 //     WDF_OBJECT_ATTRIBUTES.EvtDestroyCallback / WDF_IO_QUEUE_CONFIG.
+//     Publication (WdfControlFinishInitializing) is deliberately NOT part of
+//     SkDeviceCreate: SkDevicePublish — called by DriverEntry only after
+//     SkLifecycleStart succeeded and ShRuntimeActivate ran — is the step that
+//     makes the device reachable at all.
 //   * All file-object callbacks (create/cleanup/close/destroy) and the IOCTL
 //     dispatch body live in control/ioctl.c.
 //
 // SDDL: D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)
 //   — SYSTEM/Administrators full control (GA), others generic read (GR).
 // Privilege model (design note lives in control/ioctl.c): modify commands are
-// re-authorized at handle-create and cached as a handle-scoped capability;
+// re-authorized at handle-create — against the creator's EFFECTIVE token
+// (impersonation/UAC deny-only aware) — and cached as a handle-scoped
+// capability;
 // this SDDL is the primary boundary and the per-handle cache is defense in
 // depth. The GR-to-WD (Everyone) leg is a deliberate query/telemetry surface
 // (capabilities/rule metadata/stats/event records are readable by any local
@@ -50,8 +56,16 @@ static VOID skInitUnicode(PUNICODE_STRING us, const WCHAR *s, ULONG bytes) {
 }
 
 // ---------------------------------------------------------------------------
-// SkDeviceCreate: build the control device and return its WDM device object
-// (lifecycle needs the WDM object for FwpsCalloutRegister1).
+// SkDeviceCreate: build the control device — UNPUBLISHED — and return its WDM
+// device object (lifecycle needs the WDM object for FwpsCalloutRegister1).
+// Unpublished means WdfControlFinishInitializing has NOT run: KMDF itself
+// completes every create/IOCTL aimed at the device without invoking any driver
+// callback, so EvtFileCreate cannot run before DriverEntry finishes
+// SkLifecycleStart + ShRuntimeActivate and calls SkDevicePublish. This closes
+// the old race where a create slipped between WdfControlFinishInitializing
+// (formerly the last step of this function) and SkControlInit's
+// ShRundownInit(&g_HandleCreateRundown): that create Acquired a rundown which
+// init then reset, orphaning its in-flight count/stop-bit pairing.
 // Failure contract: this function cleans up after itself; the caller does
 // nothing on failure. Pre-create failures (allocate / assign-name /
 // WdfDeviceCreate) free the caller-owned deviceInit with WdfDeviceInitFree;
@@ -171,8 +185,10 @@ NTSTATUS SkDeviceCreate(PDRIVER_OBJECT driverObject, PDEVICE_OBJECT *wdmDeviceOu
         goto fail_delete_device;
     // Non-PnP control device has no PDO, so device interfaces are
     // unavailable; the only user-mode open path is \\.\ShinkenWfp.
-
-    WdfControlFinishInitializing(g_SkControlWdfDevice);
+    // Success: the device leaves here UNPUBLISHED — no
+    // WdfControlFinishInitializing here. DriverEntry publishes via
+    // SkDevicePublish once every subsystem started and the runtime activated;
+    // until then KMDF completes any create/IOCTL itself.
     *wdmDeviceOut = WdfDeviceWdmGetDeviceObject(g_SkControlWdfDevice);
     return STATUS_SUCCESS;
 
@@ -182,9 +198,26 @@ fail_delete_device:
 }
 
 // ---------------------------------------------------------------------------
-// SkDeviceDelete: delete the control device (idempotent). Called by
-// control/ioctl.c's SkControlDestroy — reachable only after the runtime gate
-// (ShRuntimeDestroyAllowed) allows destroy. WdfObjectDelete takes the queue
+// SkDevicePublish: publish the control device (WdfControlFinishInitializing).
+// DriverEntry calls this ONLY after SkLifecycleStart succeeded and
+// ShRuntimeActivate opened the runtime gate; from this point on KMDF delivers
+// creates/IOCTLs to the control/ioctl.c callbacks. Every gate the create path
+// depends on — SkControlInit's handle-create rundown, the request gate, the
+// consumer thread — is therefore provably ready before the first create can
+// arrive. VOID: WdfControlFinishInitializing has no failure path; the NULL
+// guard keeps the idempotent no-op contract symmetric with SkDeviceDelete
+// (no device → nothing to publish).
+// ---------------------------------------------------------------------------
+VOID SkDevicePublish(void) {
+    if (g_SkControlWdfDevice != NULL)
+        WdfControlFinishInitializing(g_SkControlWdfDevice);
+}
+
+// ---------------------------------------------------------------------------
+// SkDeviceDelete: delete the control device (idempotent, published or not —
+// lifecycle rollback deletes the unpublished device of a failed start).
+// Called by control/ioctl.c's SkControlDestroy — reachable only after the
+// runtime gate (ShRuntimeDestroyAllowed) allows destroy. WdfObjectDelete takes the queue
 // with it (the queue is a child of the device), so the queue global is
 // cleared in the same step: a stale WDFQUEUE handle must never survive the
 // device it belongs to (a later purge/quiesce on it would touch a freed
